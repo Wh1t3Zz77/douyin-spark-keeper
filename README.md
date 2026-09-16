@@ -2,7 +2,7 @@
   <img src="docs/assets/spark-keeper-banner.png" alt="Spark Keeper" width="100%">
 </p>
 
-# 🔥 火花值守（Spark Keeper）
+# 🔥 抖音自动火花值守（Spark Keeper）
 
 一个可自行部署的抖音网页端续火管理系统。它通过浏览器自动化维护登录状态、读取最近会话，并按计划发送预先设置的消息。
 
@@ -11,7 +11,7 @@
 > [!WARNING]
 > 本项目依赖抖音网页端和浏览器自动化，不是抖音官方接口。网页改版、登录状态、平台规则或风控均可能使任务失败。请仅操作你本人拥有或已获明确授权的账号。
 
-## 作者站点与公开邀请码
+## 🌐 作者站点与公开邀请码
 
 作者运行的火花值守站点：[https://spark.vv23.store](https://spark.vv23.store)
 
@@ -23,7 +23,7 @@
 - `SPARK-H4FG-GK2C`
 - `SPARK-HSTY-T7DG`
 
-## 支持的部署场景
+## 🖥️ 支持的部署场景
 
 | 场景 | 浏览器入口 | 默认安全边界 |
 | --- | --- | --- |
@@ -33,7 +33,7 @@
 | 私有服务器 | IP、内网域名或 VPN 地址 | 建议限制来源，不直接暴露端口 |
 | 公网服务器 | `https://你的域名` | 必须配置 HTTPS、强密钥和邮件验证 |
 
-## 功能
+## ✨ 功能
 
 - 多个抖音账号独立绑定与状态管理。
 - 最近会话同步、好友选择和自定义消息。
@@ -42,7 +42,7 @@
 - 邀请码注册和管理员视图，适合单用户或小范围共享。
 - SQLite 持久化，支持 Docker 卷备份和迁移。
 
-## 五分钟本机启动
+## 🚀 五分钟本机启动
 
 需要 Docker Desktop（Windows/macOS）或 Docker Engine + Compose 插件（Linux）。首次构建会下载镜像和浏览器运行环境，耗时取决于网络。
 
@@ -79,7 +79,7 @@ docker compose ps
 docker compose logs --tail=100
 ```
 
-## 选择你的部署方式
+## 🧭 选择你的部署方式
 
 - [个人电脑：Windows、macOS、Linux](docs/DEPLOY-COMPUTER.md)
 - [局域网、软路由、NAS 与 ARM 设备](docs/DEPLOY-LAN-NAS.md)
@@ -90,7 +90,7 @@ docker compose logs --tail=100
 - [参与贡献](CONTRIBUTING.md)
 - [变更记录](CHANGELOG.md)
 
-## 架构
+## 🏗️ 架构
 
 浏览器只访问一个入口端口。内置 Caddy 将 `/api/*` 转发给 FastAPI，其余请求转发给前端，因此本机和局域网部署不需要额外安装 Nginx，也不存在前端与 API 端口不一致的问题。
 
@@ -107,15 +107,15 @@ docker compose logs --tail=100
 docker compose --profile mail up -d
 ```
 
-## 数据与隐私
+## 🔐 数据与隐私
 
 数据库、登录 Cookie、浏览器资料和任务日志都可能包含敏感信息。它们保存在 Docker 数据卷中，不属于源码，禁止提交到 Git 仓库或公开分享。备份文件也应加密并限制访问。
 
-## 自动检查
+## ✅ 自动检查
 
 仓库内置 GitHub Actions，会在提交到 `main` 或发起 Pull Request 时自动执行前端类型检查与生产构建、npm 安全审计、后端测试和 Compose 配置校验。浏览器自动化的真实账号流程仍必须由维护者在隔离的测试账号和实机环境中人工验证。
 
-## 使用边界
+## ⚠️ 使用边界
 
 - 系统不会破解验证码或绕过安全验证。
 - 出现扫码确认、短信验证、风险提示或结果不确定时，应由账号本人处理。
@@ -133,7 +133,7 @@ docker compose --profile mail up -d
 
 列为“参考”不表示本项目与其作者存在合作或获得官方背书。涉及代码改编的部分会保留相应版权和许可证说明。
 
-## 开源许可
+## 📄 开源许可
 
 本项目采用 [MIT License](LICENSE)。你可以使用、修改、分发和再许可本项目，但必须保留许可证中的版权与许可声明。第三方改编部分仍同时受 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) 中相应许可约束。
 
