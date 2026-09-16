@@ -11,6 +11,18 @@
 > [!WARNING]
 > 本项目依赖抖音网页端和浏览器自动化，不是抖音官方接口。网页改版、登录状态、平台规则或风控均可能使任务失败。请仅操作你本人拥有或已获明确授权的账号。
 
+## 作者站点与公开邀请码
+
+作者运行的火花值守站点：[https://spark.vv23.store](https://spark.vv23.store)
+
+以下邀请码公开提供，可能随时被使用或失效：
+
+- `SPARK-KLTR-WJB7`
+- `SPARK-AZRH-GBXA`
+- `SPARK-BB8V-2H2R`
+- `SPARK-H4FG-GK2C`
+- `SPARK-HSTY-T7DG`
+
 ## 支持的部署场景
 
 | 场景 | 浏览器入口 | 默认安全边界 |
