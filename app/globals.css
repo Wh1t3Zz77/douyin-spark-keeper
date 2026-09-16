@@ -1,0 +1,31 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+@import 'shadcn/tailwind.css';
+
+@custom-variant dark (&:is(.dark *));
+@theme inline {
+  --color-background: var(--background); --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans); --font-mono: var(--font-geist-mono);
+  --color-primary: var(--primary); --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary); --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted); --color-muted-foreground: var(--muted-foreground);
+  --color-border: var(--border); --color-input: var(--input); --color-ring: var(--ring);
+  --color-destructive: var(--destructive); --color-card: var(--card); --color-card-foreground: var(--card-foreground);
+  --radius-sm: calc(var(--radius) * .6); --radius-md: calc(var(--radius) * .8); --radius-lg: var(--radius); --radius-xl: calc(var(--radius) * 1.4);
+}
+:root {
+  --background: oklch(.96 .01 80); --foreground: oklch(.25 .015 80);
+  --card: oklch(.995 .004 80); --card-foreground: oklch(.25 .015 80);
+  --primary: oklch(.31 .018 150); --primary-foreground: oklch(.99 0 0);
+  --secondary: oklch(.93 .012 80); --secondary-foreground: oklch(.31 .018 150);
+  --muted: oklch(.93 .012 80); --muted-foreground: oklch(.55 .015 80);
+  --border: oklch(.87 .012 80); --input: oklch(.87 .012 80); --ring: oklch(.69 .16 38);
+  --destructive: oklch(.58 .21 27); --radius: .72rem;
+}
+* { box-sizing: border-box; }
+html { background: #f4f1eb; }
+body { margin: 0; font-family: var(--font-geist-sans), "Microsoft YaHei", system-ui, sans-serif; }
+button, input { font: inherit; } button { cursor: pointer; }
+::selection { background: rgba(255,112,72,.24); }
+@keyframes toast-in { from { opacity: 0; transform: translate(-50%, 10px); } to { opacity: 1; transform: translate(-50%, 0); } }
+.toast { animation: toast-in .22s ease-out both; }

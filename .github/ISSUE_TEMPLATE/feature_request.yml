@@ -1,0 +1,37 @@
+name: 功能建议
+description: 建议适合社区版和自托管场景的新能力
+title: "[Feature] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请说明实际使用场景。项目不接受绕过验证码、安全挑战、平台风控或操作未授权账号的功能。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 使用场景与问题
+      description: 目前遇到了什么问题，影响哪些部署方式？
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议方案
+      description: 描述期望行为，不必提前确定技术实现。
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 已考虑的替代方式
+    validations:
+      required: false
+  - type: checkboxes
+    id: boundaries
+    attributes:
+      label: 使用边界
+      options:
+        - label: 此建议不涉及绕过验证码、安全挑战或平台风控。
+          required: true
+        - label: 此建议不要求操作未经授权的账号。
+          required: true
