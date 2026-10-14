@@ -67,3 +67,4 @@ next-env.d.ts
 *.webp
 *.gif
 !docs/assets/spark-keeper-banner.png
+!public/police-filing.png

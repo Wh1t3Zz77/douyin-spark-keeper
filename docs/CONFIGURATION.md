@@ -1,20 +1,26 @@
 # 配置项
 
-| 变量 | 默认/示例 | 说明 |
-| --- | --- | --- |
-| `APP_ENV` | `selfhosted` | 公网部署设为 `production` |
-| `APP_SECRET` | 无安全默认值 | 会话摘要和敏感字段加密基础，至少 32 位随机字符 |
-| `DATABASE_URL` | `sqlite:///./data/spark.db` | 默认 SQLite 数据库位置 |
-| `ADMIN_EMAIL` | 用户填写 | 使用该邮箱注册的账号成为管理员 |
-| `BOOTSTRAP_INVITE` | 用户填写 | 首次注册邀请码，只保存摘要 |
-| `BOOTSTRAP_INVITE_USES` | `1` | 首次邀请码最多使用次数 |
-| `SPARK_BIND_ADDRESS` | `127.0.0.1` | `0.0.0.0` 表示允许外部设备连接 |
-| `SPARK_PORT` | `3000` | 浏览器访问端口 |
-| `ALLOWED_ORIGINS` | 本机地址 | 逗号分隔的允许来源 |
-| `SESSION_SECURE` | `false` | HTTPS 公网部署必须设为 `true` |
-| `SESSION_DAYS` | `30` | 登录会话有效天数 |
-| `EMAIL_VERIFICATION_REQUIRED` | `false` | `true` 时必须配置 SMTP |
-| `SMTP_*` | 空 | 邮件服务器配置 |
+| 变量                                 | 默认/示例                   | 说明                                                                           |
+| ------------------------------------ | --------------------------- | ------------------------------------------------------------------------------ |
+| `APP_ENV`                            | `selfhosted`                | 公网部署设为 `production`                                                      |
+| `APP_SECRET`                         | 无安全默认值                | 会话摘要和敏感字段加密基础，至少 32 位随机字符                                 |
+| `DATABASE_URL`                       | `sqlite:///./data/spark.db` | 默认 SQLite 数据库位置                                                         |
+| `ADMIN_EMAIL`                        | 用户填写                    | 使用该邮箱注册的账号成为管理员                                                 |
+| `TASK_FAILURE_ADMIN_EMAIL`           | 空                          | 独立接收任务终止失败的管理邮箱；不受用户通知开关影响，与管理员登录邮箱分开配置 |
+| `NEXT_PUBLIC_ICP_NUMBER`             | 空                          | 网站底部的完整 ICP 备案号，仅填写自己的已批准编号                              |
+| `NEXT_PUBLIC_PUBLIC_SECURITY_NUMBER` | 空                          | 完整公安备案号，自动提取 14 位数字生成官方查询链接；图标显示在编号之前         |
+| `BOOTSTRAP_INVITE`                   | 用户填写                    | 首次注册邀请码，只保存摘要                                                     |
+| `BOOTSTRAP_INVITE_USES`              | `1`                         | 首次邀请码最多使用次数                                                         |
+| `SPARK_BIND_ADDRESS`                 | `127.0.0.1`                 | `0.0.0.0` 表示允许外部设备连接                                                 |
+| `SPARK_PORT`                         | `3000`                      | 浏览器访问端口                                                                 |
+| `ALLOWED_ORIGINS`                    | 本机地址                    | 逗号分隔的允许来源                                                             |
+| `SESSION_SECURE`                     | `false`                     | HTTPS 公网部署必须设为 `true`                                                  |
+| `SESSION_DAYS`                       | `30`                        | 登录会话有效天数                                                               |
+| `EMAIL_VERIFICATION_REQUIRED`        | `false`                     | `true` 时必须配置 SMTP                                                         |
+| `SMTP_*`                             | 空                          | 邮件服务器配置                                                                 |
 
 修改 `.env` 后运行 `docker compose up -d` 使配置生效。更改 `APP_SECRET` 会使现有会话和加密字段失效，因此不要把它当作日常轮换项；需要轮换时应先规划迁移。
 
+`NEXT_PUBLIC_*` 是公开的前端构建变量。修改备案号后执行 `docker compose build frontend`，再执行 `docker compose up -d frontend`。默认留空，个人电脑和局域网部署不展示备案号；不要使用作者站点的编号为自己的域名备案。
+
+任务失败通知按运行事件去重。普通失败最多尝试 3 次，重试中不发失败邮件；终止失败才按用户设置和管理邮箱配置通知。同一收件邮箱不重复收到用户和管理两份邮件。不按账号每日合并，也不等待全部计划结束后汇总失败事件。

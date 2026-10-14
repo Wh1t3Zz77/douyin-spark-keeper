@@ -5,7 +5,7 @@ services:
     image: caddy:2.10-alpine
     restart: unless-stopped
     ports:
-      - "${SPARK_BIND_ADDRESS:-127.0.0.1}:${SPARK_PORT:-3000}:80"
+      - '${SPARK_BIND_ADDRESS:-127.0.0.1}:${SPARK_PORT:-3000}:80'
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
     depends_on:
@@ -14,78 +14,108 @@ services:
       api:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/api/health"]
+      test: ['CMD', 'wget', '-q', '--spider', 'http://127.0.0.1/api/health']
       interval: 20s
       timeout: 8s
       retries: 5
       start_period: 10s
     logging:
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: '10m'
+        max-file: '3'
 
   frontend:
-    build: .
+    build:
+      context: .
+      args:
+        NEXT_PUBLIC_ICP_NUMBER: ${NEXT_PUBLIC_ICP_NUMBER:-}
+        NEXT_PUBLIC_PUBLIC_SECURITY_NUMBER: ${NEXT_PUBLIC_PUBLIC_SECURITY_NUMBER:-}
     restart: unless-stopped
     expose:
-      - "3000"
+      - '3000'
     mem_limit: 260m
+    memswap_limit: 260m
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      test:
+        [
+          'CMD',
+          'node',
+          '-e',
+          "fetch('http://127.0.0.1:3000/').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+        ]
       interval: 20s
       timeout: 8s
       retries: 5
       start_period: 30s
     logging:
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: '10m'
+        max-file: '3'
 
   api:
     build: ./backend
     restart: unless-stopped
     env_file: .env
-    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--proxy-headers"]
+    command:
+      [
+        'uvicorn',
+        'app.main:app',
+        '--host',
+        '0.0.0.0',
+        '--port',
+        '8000',
+        '--workers',
+        '1',
+        '--proxy-headers',
+      ]
     expose:
-      - "8000"
+      - '8000'
     volumes:
       - spark_data:/app/data
     mem_limit: 300m
+    memswap_limit: 300m
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5)"]
+      test:
+        [
+          'CMD',
+          'python',
+          '-c',
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5)",
+        ]
       interval: 20s
       timeout: 8s
       retries: 5
       start_period: 20s
     logging:
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: '10m'
+        max-file: '3'
 
   worker:
     build: ./backend
     init: true
     restart: unless-stopped
     env_file: .env
-    command: ["python", "-m", "app.worker"]
+    command: ['python', '-m', 'app.worker']
     volumes:
       - spark_data:/app/data
-    mem_limit: 1050m
+    mem_limit: 900m
+    memswap_limit: 900m
     shm_size: 192m
     depends_on:
       api:
         condition: service_healthy
     logging:
       options:
-        max-size: "20m"
-        max-file: "3"
+        max-size: '20m'
+        max-file: '3'
 
   mailer:
-    profiles: ["mail"]
+    profiles: ['mail']
     build: ./backend
     restart: unless-stopped
     env_file: .env
-    command: ["python", "-m", "app.mail_worker"]
+    command: ['python', '-m', 'app.mail_worker']
     volumes:
       - spark_data:/app/data
     mem_limit: 180m
@@ -94,9 +124,8 @@ services:
         condition: service_healthy
     logging:
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: '10m'
+        max-file: '3'
 
 volumes:
   spark_data:
-

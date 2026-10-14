@@ -20,6 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from playwright.sync_api import Page, sync_playwright
+from .identity_dom import IDENTITY_READER, ProfileCollector, identity_matches
 
 
 CHAT_URL = "https://www.douyin.com/chat"
@@ -72,6 +73,7 @@ class SendResult:
     contact_name: str
     status: str
     reason: str = ""
+    item_id: str | None = None
 
 
 def _profile_path(profile_key: str) -> str:
@@ -593,6 +595,7 @@ def list_contacts(storage_state_json: str, profile_key: str | None = None) -> tu
                 timezone_id="Asia/Shanghai",
             )
             page = _context_page(context)
+            profiles = ProfileCollector(page)
             page.goto(CHAT_URL, timeout=90000, wait_until="domcontentloaded")
             page.wait_for_timeout(7000)
             logged, reason = login_state(page)
@@ -642,35 +645,7 @@ def list_contacts(storage_state_json: str, profile_key: str | None = None) -> tu
                           item?.className || '', item?.getAttribute?.('aria-label') || '',
                           item?.getAttribute?.('title') || '', JSON.stringify(item?.dataset || {})
                         ].join(' ');
-                        let externalId = '';
-                        if (item?.dataset) {
-                          const key = Object.keys(item.dataset).find(k => /(conversation|sec.?uid|user.?id|chat.?id)/i.test(k));
-                          if (key) externalId = String(item.dataset[key] || '');
-                        }
-                        if (!externalId) {
-                          const href = item?.querySelector?.('a[href]')?.getAttribute('href') || '';
-                          const match = href.match(/[?&](?:conversation_id|sec_uid|user_id|chat_id)=([^&]+)/i);
-                          if (match) externalId = decodeURIComponent(match[1]);
-                        }
-                        if (!externalId) {
-                          const wanted = /^(?:_?toParticipantSecUserId|participantSecUserId|secUid|sec_user_id|conversationId|conversation_id)$/i;
-                          const seenObjects = new Set();
-                          const walkReactProps = (value, depth) => {
-                            if (!value || depth > 5 || typeof value !== 'object' || seenObjects.has(value)) return '';
-                            seenObjects.add(value);
-                            for (const [key, child] of Object.entries(value)) {
-                              if (wanted.test(key) && (typeof child === 'string' || typeof child === 'number') && String(child)) return String(child);
-                              const nested = walkReactProps(child, depth + 1);
-                              if (nested) return nested;
-                            }
-                            return '';
-                          };
-                          for (const node of [title, ...ancestors]) {
-                            const reactKey = Object.keys(node || {}).find(key => key.startsWith('__reactProps$'));
-                            externalId = reactKey ? walkReactProps(node[reactKey], 0) : '';
-                            if (externalId) break;
-                          }
-                        }
+                        const identity = (IDENTITY_FUNCTION)(title);
                         const avatar = item?.querySelector?.('[class*="avatar"] img, img[class*="avatar"]');
                         const avatarUrl = avatar?.getAttribute('src') || '';
                         const avatarCount = item?.querySelectorAll?.('[class*="avatar"] img, img[class*="avatar"]')?.length || 0;
@@ -684,12 +659,12 @@ def list_contacts(storage_state_json: str, profile_key: str | None = None) -> tu
                         return {
                           display_name: name,
                           conversation_type: conversationType,
-                          external_id: externalId || null,
-                          source_key: externalId || `name:${name}`,
+                          ...identity,
+                          source_key: identity.external_id || `name:${name}`,
                           avatar_url: avatarUrl || null,
                           streak_days: streakMatch ? Number(streakMatch[0]) : null,
                         };
-                    })""",
+                    })""".replace("IDENTITY_FUNCTION", IDENTITY_READER),
                 )
                 before = len(contacts)
                 for value in values:
@@ -705,6 +680,7 @@ def list_contacts(storage_state_json: str, profile_key: str | None = None) -> tu
                 page.mouse.move(190, 500)
                 page.mouse.wheel(0, 700)
                 page.wait_for_timeout(900)
+            profiles.enrich(contacts)
             return contacts[:200], None if contacts else "会话列表为空", json.dumps(context.storage_state(), ensure_ascii=False)
         finally:
             context.close()
@@ -712,71 +688,41 @@ def list_contacts(storage_state_json: str, profile_key: str | None = None) -> tu
                 browser.close()
 
 
-def _verify_conversation(page: Page, name: str) -> bool:
-    for exact in (True, False):
-        try:
-            loc = page.get_by_text(name, exact=exact)
-            for index in range(min(loc.count(), 8)):
-                box = loc.nth(index).bounding_box()
-                if box and box.get("x", 0) > 300 and box.get("y", 0) < 140:
-                    return True
-        except Exception:
-            continue
-    return False
-
-
-def _locator_external_id(locator) -> str:
+def _locator_identity(locator) -> dict:
     try:
-        return str(locator.evaluate(
-            """element => {
-                const wanted = /^(?:_?toParticipantSecUserId|participantSecUserId|secUid|sec_user_id|conversationId|conversation_id)$/i;
-                const seen = new Set();
-                const walk = (value, depth) => {
-                  if (!value || depth > 5 || typeof value !== 'object' || seen.has(value)) return '';
-                  seen.add(value);
-                  for (const [key, child] of Object.entries(value)) {
-                    if (wanted.test(key) && (typeof child === 'string' || typeof child === 'number') && String(child)) return String(child);
-                    const nested = walk(child, depth + 1);
-                    if (nested) return nested;
-                  }
-                  return '';
-                };
-                let node = element;
-                for (let depth = 0; node && depth < 6; depth += 1, node = node.parentElement) {
-                  const reactKey = Object.keys(node).find(key => key.startsWith('__reactProps$'));
-                  const found = reactKey ? walk(node[reactKey], 0) : '';
-                  if (found) return found;
-                }
-                return '';
-            }"""
-        ) or "")
+        return locator.evaluate(IDENTITY_READER) or {}
     except Exception:
-        return ""
+        return {}
+
+
+def _verify_conversation(page: Page, external_id: str) -> bool:
+    # The selected row must still point to the requested stable identity.
+    # A matching title alone is never evidence of identity.
+    try:
+        selected = page.locator(".conversationConversationItemcurConversation")
+        if selected.count() != 1:
+            return False
+        return identity_matches(_locator_identity(selected.first), external_id)
+    except Exception:
+        return False
 
 
 def _find_conversation_title(page: Page, name: str, external_id: str | None = None):
-    def current_match():
-        try:
-            titles = page.locator(".conversationConversationItemtitle")
-            for index in range(min(titles.count(), 80)):
-                title = titles.nth(index)
-                if not title.is_visible():
-                    continue
-                rendered_name = (title.inner_text() or "").strip()
-                if rendered_name == name or (external_id and _locator_external_id(title) == external_id):
-                    return title, rendered_name
-        except Exception:
-            pass
+    if not external_id:
         return None
-
-    match = current_match()
-    if match:
-        return match
+    def current_match():
+        matches = []
+        titles = page.locator(".conversationConversationItemtitle")
+        for index in range(min(titles.count(), 100)):
+            title = titles.nth(index)
+            if title.is_visible() and identity_matches(_locator_identity(title), external_id):
+                matches.append((title, (title.inner_text() or "").strip()))
+        return matches[0] if len(matches) == 1 else None
     try:
         page.mouse.move(190, 500)
         page.mouse.wheel(0, -12000)
         page.wait_for_timeout(700)
-        for _ in range(24):
+        for _ in range(32):
             match = current_match()
             if match:
                 return match
@@ -787,51 +733,27 @@ def _find_conversation_title(page: Page, name: str, external_id: str | None = No
     return None
 
 
-def _click_conversation_title(page: Page, title, expected_name: str) -> bool:
+def _click_conversation_title(page: Page, title, external_id: str) -> bool:
     try:
+        # Virtualized rows may have recycled between scan and click.
+        if not identity_matches(_locator_identity(title), external_id):
+            return False
         row = title.locator('xpath=ancestor::*[@data-e2e="conversation-item"][1]')
         (row.first if row.count() else title).click(force=True, timeout=8000)
         page.wait_for_timeout(random.randint(1500, 2600))
-        return _verify_conversation(page, expected_name)
+        return _verify_conversation(page, external_id)
     except Exception:
         return False
 
 
 def _open_contact(page: Page, name: str, external_id: str | None = None) -> bool:
     match = _find_conversation_title(page, name, external_id)
-    if match and _click_conversation_title(page, match[0], match[1] or name):
-        return True
-
-    for _ in range(2):
-        try:
-            search = page.get_by_placeholder("搜索", exact=False).first
-            if not search.count():
-                return False
-            search.fill("")
-            search.click()
-            search.type(name, delay=80)
-            page.wait_for_timeout(3000)
-            matches = page.get_by_text(name, exact=True)
-            for index in range(min(matches.count(), 12)):
-                target = matches.nth(index)
-                box = target.bounding_box() if target.is_visible() else None
-                if not box or box.get("x", 999) > 360:
-                    continue
-                row = target.locator("xpath=ancestor-or-self::*[contains(@class,'SearchPanelitem')][1]")
-                (row.first if row.count() else target).click(force=True, timeout=8000)
-                page.wait_for_timeout(2200)
-                message_button = page.get_by_text("发消息", exact=False).first
-                if message_button.count() and message_button.is_visible():
-                    message_button.click(force=True)
-                    page.wait_for_timeout(1800)
-                if _verify_conversation(page, name):
-                    return True
-        except Exception:
-            pass
-    return False
+    return bool(match and _click_conversation_title(page, match[0], external_id))
 
 
 def _send_one(page: Page, name: str, message: str, external_id: str | None = None) -> SendResult:
+    if not external_id:
+        return SendResult(name, "needs_selection", "缺少稳定好友标识，请重新同步好友并重新选择")
     if not _open_contact(page, name, external_id):
         return SendResult(name, "failed", "找不到好友或无法确认会话标题")
     challenge = security_challenge(page)
@@ -849,6 +771,10 @@ def _send_one(page: Page, name: str, message: str, external_id: str | None = Non
         current = box.inner_text() or ""
         if message not in current:
             return SendResult(name, "failed", "消息没有进入输入框")
+        if not _verify_conversation(page, external_id):
+            page.keyboard.press("Control+A")
+            page.keyboard.press("Delete")
+            return SendResult(name, "failed", "发送前会话身份校验失败，已停止发送")
         page.keyboard.press("Enter")
         deadline = time.time() + 8
         while time.time() < deadline:
@@ -862,11 +788,13 @@ def _send_one(page: Page, name: str, message: str, external_id: str | None = Non
 
 def send_batch(
     storage_state_json: str,
-    recipients: list[tuple[str, str] | tuple[str, str, str | None]],
+    recipients: list[tuple[str, str, str | None, str]],
     on_before_send: Callable[[str], None] | None = None,
     on_result: Callable[[SendResult], None] | None = None,
     profile_key: str | None = None,
 ) -> tuple[list[SendResult], str | None, str]:
+    if not recipients:
+        return [], None, storage_state_json
     state = json.loads(storage_state_json)
     results: list[SendResult] = []
     with sync_playwright() as playwright:
@@ -899,8 +827,9 @@ def send_batch(
                 name, message = recipient[:2]
                 external_id = recipient[2] if len(recipient) > 2 else None
                 if on_before_send:
-                    on_before_send(name)
+                    on_before_send(recipient[3] if len(recipient) > 3 else name)
                 result = _send_one(page, name, message, external_id)
+                result.item_id = recipient[3] if len(recipient) > 3 else None
                 if on_result:
                     on_result(result)
                 if result.status == "failed" and result.reason == "找不到好友或无法确认会话标题":

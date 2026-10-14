@@ -1,5 +1,9 @@
 import logging
 import json
+import os
+import signal
+import subprocess
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -9,7 +13,9 @@ from .database import Base, SessionLocal, engine
 from .mailer import enqueue_email
 from .douyin import bind_account, list_contacts, send_batch
 from .models import BindingSession, Contact, ContactSync, DouyinAccount, NotificationPreference, Run, RunItem, Task, TaskRecipient, User, UserEntitlement, utcnow
+from .identity import MISSING_ID, snapshot_item, resolve_run_contact, sync_contacts, recent_contacts
 from .security import decrypt_text, encrypt_text
+from .config import get_settings
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -17,6 +23,8 @@ logger = logging.getLogger("spark-worker")
 GLOBAL_TASK_GAP = timedelta(minutes=5)
 CHINA_TZ = timezone(timedelta(hours=8))
 AUTOMATION_GUARD = timedelta(minutes=6)
+RUN_TIMEOUT_SECONDS = 20 * 60
+RUN_STOP_GRACE_SECONDS = 10
 
 
 def _current_schedule(value: datetime, now: datetime) -> datetime:
@@ -91,7 +99,7 @@ def schedule_due_tasks() -> None:
             existing = db.scalar(select(Run).where(Run.task_id == task.id, Run.scheduled_for == scheduled_for))
             if not existing:
                 run = Run(task_id=task.id, user_id=task.user_id, scheduled_for=scheduled_for)
-                run.items = [RunItem(contact_name=r.contact_name, message=r.message) for r in task.recipients if r.enabled]
+                run.items = [snapshot_item(db, task, r) for r in task.recipients if r.enabled]
                 db.add(run)
             task.next_run_at = scheduled_for + timedelta(days=1)
         db.commit()
@@ -125,9 +133,25 @@ def claim_one() -> str | None:
                     "task_failed",
                 )
             else:
-                item.status = "pending"
-                item.claimed_at = None
-                item.started_at = None
+                # A worker can disappear before the first send (for example,
+                # after hitting its memory limit). Requeueing that same run
+                # would repeat the resource failure indefinitely.
+                item.status = "failed"
+                item.error_code = "WORKER_INTERRUPTED"
+                item.error_message = "浏览器任务异常中断，本次没有自动重试"
+                item.finished_at = now
+                for child in item.items:
+                    if child.status == "pending":
+                        child.status = "skipped"
+                        child.reason = "浏览器任务异常中断，已停止后续发送"
+                        child.finished_at = now
+                notify_failure(
+                    db,
+                    item,
+                    failure_email_subject(db, item, "发送任务已停止"),
+                    failure_email_body(db, item, item.error_message),
+                    "task_failed",
+                )
         if stale:
             db.commit()
         expired_pending = db.scalars(select(Run).where(Run.status == "pending", Run.scheduled_for <= now)).all()
@@ -265,58 +289,13 @@ def process_contact_sync() -> bool:
             account = db.get(DouyinAccount, account_id)
             saved_contacts: list[dict] = []
             if sync and not error:
-                planned_by_name = {
-                    recipient.contact_name: recipient
-                    for recipient in db.scalars(
-                        select(TaskRecipient).join(Task).where(Task.account_id == account_id, Task.user_id == sync.user_id)
-                    ).all()
-                }
-                for raw in contacts:
-                    item = raw if isinstance(raw, dict) else {"display_name": str(raw), "conversation_type": "unknown"}
-                    name = str(item.get("display_name") or "").strip()
-                    if not name:
-                        continue
-                    conversation_type = str(item.get("conversation_type") or "unknown")
-                    if conversation_type not in {"friend", "group", "unknown"}:
-                        conversation_type = "unknown"
-                    source_key = str(item.get("source_key") or item.get("external_id") or f"name:{name}")[:240]
-                    contact = db.scalar(select(Contact).where(Contact.account_id == account_id, Contact.source_key == source_key))
-                    if not contact and item.get("external_id"):
-                        contact = db.scalar(
-                            select(Contact).where(
-                                Contact.account_id == account_id,
-                                Contact.display_name == name,
-                                Contact.external_id.is_(None),
-                            )
-                        )
-                        if contact:
-                            contact.source_key = source_key
-                    if not contact:
-                        contact = Contact(account_id=account_id, user_id=sync.user_id, source_key=source_key, display_name=name)
-                        db.add(contact)
-                    contact.display_name = name
-                    if not contact.type_locked:
-                        contact.conversation_type = conversation_type
-                    contact.external_id = str(item.get("external_id") or "")[:240] or None
-                    contact.avatar_url = str(item.get("avatar_url") or "")[:2000] or None
-                    streak = item.get("streak_days")
-                    contact.streak_days = int(streak) if isinstance(streak, (int, float)) else None
-                    contact.last_seen_at = utcnow()
-                    planned = planned_by_name.get(name)
-                    if planned and not contact.selected:
-                        contact.selected = True
-                        contact.planned_message = planned.message
-                    db.flush()
-                    saved_contacts.append({
-                        "id": contact.id,
-                        "display_name": contact.display_name,
-                        "conversation_type": contact.conversation_type,
-                        "avatar_url": contact.avatar_url,
-                        "streak_days": contact.streak_days,
-                        "selected": contact.selected,
-                        "message": contact.planned_message,
-                        "last_seen_at": contact.last_seen_at.isoformat() + "Z",
-                    })
+                sync_contacts(db, account_id, sync.user_id, contacts)
+                saved = recent_contacts(db, account_id, sync.user_id, sync.created_at)
+                saved_contacts = [{"id": c.id, "display_name": c.display_name,
+                    "conversation_type": c.conversation_type, "selected": c.selected,
+                    "message": c.planned_message, "douyin_id": c.douyin_id,
+                    "identity_ready": bool(c.external_id and not c.identity_conflict),
+                    "last_seen_at": c.last_seen_at.isoformat() + "Z"} for c in saved]
             if sync:
                 sync.contacts_json = json.dumps(saved_contacts if not error else contacts, ensure_ascii=False)
                 sync.status = "complete" if not error else "error"
@@ -342,8 +321,19 @@ def process_contact_sync() -> bool:
 def notify_failure(db, run: Run, subject: str, body: str, preference: str) -> None:
     user = db.get(User, run.user_id)
     pref = db.get(NotificationPreference, run.user_id)
-    if user and pref and pref.enabled and getattr(pref, preference, False):
-        enqueue_email(db, user.email, subject, body, user.id)
+    admin_email = get_settings().task_failure_admin_email.strip()
+    user_enabled = bool(user and pref and pref.enabled and getattr(pref, preference, False))
+    event_key = f"run-failure:{run.id}:{preference}"
+    if admin_email:
+        admin_body = "\n".join([
+            f"网站用户：{user.username if user else '已删除用户'}",
+            f"用户邮箱：{user.email if user else '未知'}",
+            f"运行记录：{run.id}", f"失败代码：{run.error_code or run.status}", "", body,
+        ])
+        enqueue_email(db, admin_email, f"[管理通知] {user.username if user else '未知用户'} · {subject}",
+            admin_body, user.id if user else None, dedup_key=event_key+":admin")
+    if user_enabled and (not admin_email or user.email.casefold() != admin_email.casefold()):
+        enqueue_email(db, user.email, subject, body, user.id, dedup_key=event_key+":user")
 
 
 def failure_email_body(db, run: Run, intro: str) -> str:
@@ -382,7 +372,7 @@ def _create_retry(db, run: Run, items: list[RunItem]) -> None:
         status="pending",
         attempt=run.attempt + 1,
     )
-    retry.items = [RunItem(contact_name=item.contact_name, message=item.message) for item in items]
+    retry.items = [RunItem(contact_name=item.contact_name, message=item.message, recipient_id=item.recipient_id, contact_id=item.contact_id, external_id=item.external_id) for item in items]
     db.add(retry)
     run.status = "retrying"
 
@@ -499,14 +489,18 @@ def execute_run(run_id: str) -> None:
             notify_failure(db, run, failure_email_subject(db, run, "需要重新绑定"), failure_email_body(db, run, "自动任务未执行，因为抖音账号尚未绑定或登录已失效。"), "login_expired")
             db.commit()
             return
-        task_recipient_by_name = {item.contact_name: item for item in task.recipients}
         recipients = []
         for item in run.items:
             if item.status != "pending":
                 continue
-            task_recipient = task_recipient_by_name.get(item.contact_name)
-            contact = db.get(Contact, task_recipient.contact_id) if task_recipient and task_recipient.contact_id else None
-            recipients.append((item.contact_name, item.message, contact.external_id if contact else None))
+            contact = resolve_run_contact(db, task, item)
+            if not contact:
+                item.status = "needs_selection"
+                item.reason = MISSING_ID
+                item.finished_at = utcnow()
+                continue
+            recipients.append((contact.display_name, item.message, item.external_id, item.id))
+        db.commit()
         try:
             state_json = decrypt_text(account.state_ciphertext)
         except Exception:
@@ -519,18 +513,18 @@ def execute_run(run_id: str) -> None:
             db.commit()
             return
 
-    def on_before_send(contact_name: str) -> None:
+    def on_before_send(item_id: str) -> None:
         with SessionLocal() as item_db:
-            item = item_db.scalar(select(RunItem).where(RunItem.run_id == run_id, RunItem.contact_name == contact_name))
+            item = item_db.scalar(select(RunItem).where(RunItem.run_id == run_id, RunItem.id == item_id))
             if not item or item.status != "pending":
-                raise RuntimeError(f"发送明细状态异常：{contact_name}")
+                raise RuntimeError(f"发送明细状态异常：{item_id}")
             item.status = "sending"
             item.started_at = utcnow()
             item_db.commit()
 
     def on_result(result) -> None:
         with SessionLocal() as item_db:
-            item = item_db.scalar(select(RunItem).where(RunItem.run_id == run_id, RunItem.contact_name == result.contact_name))
+            item = item_db.scalar(select(RunItem).where(RunItem.run_id == run_id, RunItem.id == result.item_id))
             if not item:
                 raise RuntimeError(f"发送明细不存在：{result.contact_name}")
             item.status = result.status
@@ -552,9 +546,9 @@ def execute_run(run_id: str) -> None:
         if account and refreshed_state:
             account.state_ciphertext = encrypt_text(refreshed_state)
             account.last_verified_at = utcnow()
-        result_map = {item.contact_name: item for item in results}
+        result_map = {item.item_id: item for item in results}
         for item in run.items:
-            result = result_map.get(item.contact_name)
+            result = result_map.get(item.id)
             if result:
                 item.status = result.status
                 item.reason = result.reason or None
@@ -576,7 +570,11 @@ def execute_run(run_id: str) -> None:
                     item.reason = fatal.split(":", 1)[1]
             uncertain = [item for item in run.items if item.status == "uncertain"]
             failed = [item for item in run.items if item.status == "failed"]
-            if uncertain:
+            if any(item.status == "needs_selection" for item in run.items):
+                run.status = "needs_review"
+                run.error_code = "CONTACT_IDENTITY_REQUIRED"
+                run.error_message = MISSING_ID
+            elif uncertain:
                 run.status = "needs_review"
                 run.error_code = "DELIVERY_UNCERTAIN"
                 run.error_message = "服务异常时部分发送结果无法确认，为避免重复没有自动重试"
@@ -604,7 +602,11 @@ def execute_run(run_id: str) -> None:
             retry_items = [item for item in run.items if item.status == "failed"]
             submitted = [item for item in run.items if item.status == "submitted"]
             uncertain = [item for item in run.items if item.status == "uncertain"]
-            if uncertain:
+            if any(item.status == "needs_selection" for item in run.items):
+                run.status = "needs_review"
+                run.error_code = "CONTACT_IDENTITY_REQUIRED"
+                run.error_message = MISSING_ID
+            elif uncertain:
                 run.status = "needs_review"
                 run.error_code = "DELIVERY_UNCERTAIN"
                 run.error_message = "部分发送结果无法确认，为避免重复没有自动重试"
@@ -618,8 +620,100 @@ def execute_run(run_id: str) -> None:
                 notify_failure(db, run, failure_email_subject(db, run, "连续失败 3 次"), failure_email_body(db, run, "你的续火任务连续执行 3 次仍未完成，已停止自动重试。"), "task_failed")
             else:
                 run.status = "success" if submitted else "skipped"
+        if run.status in {"failed", "needs_login", "needs_account", "security_challenge", "needs_review"}:
+            preference = "security_challenge" if run.status == "security_challenge" else (
+                "login_expired" if run.status in {"needs_login", "needs_account"} else "task_failed")
+            notify_failure(db, run, failure_email_subject(db, run, "任务未完成"),
+                failure_email_body(db, run, run.error_message or "任务未完成，请查看运行记录。"), preference)
         _settle_retry_ancestors(db, run)
         db.commit()
+
+
+def settle_interrupted_run(run_id: str, error_code: str) -> None:
+    """Stop an interrupted batch without risking duplicate messages."""
+    now = utcnow()
+    with SessionLocal() as db:
+        run = db.get(Run, run_id)
+        if not run or run.status != "running":
+            return
+        may_have_sent = False
+        for item in run.items:
+            if item.status == "sending":
+                may_have_sent = True
+                item.status = "uncertain"
+                item.reason = "浏览器任务中断，发送结果无法确认；为避免重复未自动重试"
+                item.finished_at = now
+            elif item.status in {"submitted", "uncertain"}:
+                may_have_sent = True
+            elif item.status == "pending":
+                item.status = "skipped"
+                item.reason = "同批次浏览器任务中断，已停止后续发送"
+                item.finished_at = now
+        run.status = "needs_review" if may_have_sent else "failed"
+        run.error_code = error_code
+        run.error_message = "浏览器任务超时，已停止；请核对发送结果" if error_code == "RUN_TIMEOUT" else "浏览器进程异常退出，已停止；请核对发送结果"
+        run.finished_at = now
+        notify_failure(
+            db,
+            run,
+            failure_email_subject(db, run, "发送任务已停止"),
+            failure_email_body(db, run, run.error_message),
+            "task_failed",
+        )
+        db.commit()
+
+
+def _stop_run_process_group(process: subprocess.Popen) -> bool:
+    """Terminate the browser subprocess tree, including Chromium children."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=RUN_STOP_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=RUN_STOP_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            return False
+    return True
+
+
+def execute_run_isolated(run_id: str) -> None:
+    """Bound a browser run independently of Playwright's per-call timeouts."""
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "app.worker", "--execute-run", run_id],
+            start_new_session=True,
+        )
+    except OSError:
+        logger.exception("could not start browser run %s", run_id)
+        settle_interrupted_run(run_id, "WORKER_EXITED")
+        return
+    try:
+        exit_code = process.wait(timeout=RUN_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        logger.error("browser run exceeded %ss: %s", RUN_TIMEOUT_SECONDS, run_id)
+        if not _stop_run_process_group(process):
+            raise RuntimeError("browser process group did not stop after SIGKILL")
+        settle_interrupted_run(run_id, "RUN_TIMEOUT")
+        return
+    if exit_code != 0:
+        logger.error("browser run exited with code %s: %s", exit_code, run_id)
+        if not _stop_run_process_group(process):
+            raise RuntimeError("browser process group did not stop after child exit")
+        settle_interrupted_run(run_id, "WORKER_EXITED")
+    else:
+        # A child returning without settling the run is also an abnormal exit.
+        with SessionLocal() as db:
+            run = db.get(Run, run_id)
+            still_running = bool(run and run.status == "running")
+        if still_running:
+            settle_interrupted_run(run_id, "WORKER_EXITED")
 
 
 def main() -> None:
@@ -631,7 +725,7 @@ def main() -> None:
             process_daily_notifications()
             run_id = claim_one()
             if run_id:
-                execute_run(run_id)
+                execute_run_isolated(run_id)
             elif not automation_due_soon():
                 if not process_binding():
                     process_contact_sync()
@@ -641,4 +735,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) == 1:
+        main()
+    elif len(sys.argv) == 3 and sys.argv[1] == "--execute-run":
+        execute_run(sys.argv[2])
+    else:
+        raise SystemExit(2)

@@ -26,6 +26,20 @@ import app.worker as worker_module
 from app.worker import claim_one, schedule_due_tasks
 
 
+def saved_recipient(account_id: str, name: str, message: str) -> dict:
+    """Seed a synthetic synced identity for existing API behavior tests."""
+    with SessionLocal() as db:
+        account = db.get(DouyinAccount, account_id)
+        contact = db.scalar(select(Contact).where(Contact.account_id == account_id, Contact.display_name == name))
+        if not contact:
+            identity = f"conv:test:{name}"
+            contact = Contact(account_id=account_id, user_id=account.user_id,
+                source_key=identity, external_id=identity, display_name=name, conversation_type="friend")
+            db.add(contact)
+            db.commit()
+        return {"contact_id": contact.id, "contact_name": name, "message": message}
+
+
 def register(client: TestClient, username: str, email: str) -> None:
     started = client.post(
         "/api/auth/register/start",
@@ -94,7 +108,7 @@ def test_registration_login_and_tenant_isolation():
                 "account_id": account_id,
                 "name": "晚间续火",
                 "send_time": "20:10",
-                "recipients": [{"contact_name": "好友A", "message": "今日火花"}],
+                "recipients": [saved_recipient(account_id, "好友A", "今日火花")],
             },
         )
         assert task.status_code == 201, task.text
@@ -106,7 +120,7 @@ def test_registration_login_and_tenant_isolation():
                 "account_id": account_id,
                 "name": "晚间续火",
                 "send_time": "20:20",
-                "recipients": [{"contact_name": "好友A", "message": "你好"}],
+                "recipients": [saved_recipient(account_id, "好友A", "你好")],
             },
         )
         assert updated.status_code == 200, updated.text
@@ -137,7 +151,7 @@ def test_registration_login_and_tenant_isolation():
                     "account_id": account_id,
                     "name": "越权任务",
                     "send_time": "21:10",
-                    "recipients": [{"contact_name": "好友B", "message": "今日火花"}],
+                    "recipients": [saved_recipient(account_id, "好友B", "今日火花")],
                 },
             )
             assert forbidden.status_code == 404
@@ -218,7 +232,7 @@ def test_free_access_expires_seven_days_after_registration():
         account = client.post("/api/accounts", json={"name": "到期账号"}).json()
         existing_task = client.post(
             "/api/tasks",
-            json={"account_id": account["id"], "name": "到期前计划", "send_time": "07:28", "recipients": [{"contact_name": "好友A", "message": "今日火花"}]},
+            json={"account_id": account["id"], "name": "到期前计划", "send_time": "07:28", "recipients": [saved_recipient(account["id"], "好友A", "今日火花")]},
         )
         assert existing_task.status_code == 201, existing_task.text
         with SessionLocal() as db:
@@ -237,7 +251,7 @@ def test_free_access_expires_seven_days_after_registration():
         assert me.json()["limits"]["tasks_per_account"] == 0
         blocked = client.post(
             "/api/tasks",
-            json={"account_id": account["id"], "name": "过期计划", "send_time": "07:29", "recipients": [{"contact_name": "好友A", "message": "今日火花"}]},
+            json={"account_id": account["id"], "name": "过期计划", "send_time": "07:29", "recipients": [saved_recipient(account["id"], "好友A", "今日火花")]},
         )
         assert blocked.status_code == 403
         assert "套餐已到期" in blocked.json()["detail"]
@@ -252,7 +266,7 @@ def test_expired_free_user_has_already_queued_run_cancelled_before_execution():
         account = client.post("/api/accounts", json={"name": "排队账号"}).json()
         task = client.post(
             "/api/tasks",
-            json={"account_id": account["id"], "name": "到期边界计划", "send_time": "07:28", "recipients": [{"contact_name": "好友A", "message": "今日火花"}]},
+            json={"account_id": account["id"], "name": "到期边界计划", "send_time": "07:28", "recipients": [saved_recipient(account["id"], "好友A", "今日火花")]},
         ).json()
         with SessionLocal() as db:
             user = db.query(User).filter(User.email == "expired-queue@example.com").one()
@@ -292,7 +306,7 @@ def test_pro_limits_and_expiry_are_returned_by_me():
         account = client.post("/api/accounts", json={"name": "Pro 到期账号"}).json()
         task = client.post(
             "/api/tasks",
-            json={"account_id": account["id"], "name": "Pro 到期计划", "send_time": "07:28", "recipients": [{"contact_name": "好友A", "message": "今日火花"}]},
+            json={"account_id": account["id"], "name": "Pro 到期计划", "send_time": "07:28", "recipients": [saved_recipient(account["id"], "好友A", "今日火花")]},
         ).json()
 
         with SessionLocal() as db:
@@ -356,8 +370,8 @@ def test_account_limit_is_five_per_user():
                     "name": f"免费计划 {number + 1}",
                     "send_time": send_time,
                     "recipients": [
-                        {"contact_name": f"好友{number * 2 + 1}", "message": "今日火花"},
-                        {"contact_name": f"好友{number * 2 + 2}", "message": "今日火花"},
+                        saved_recipient(accounts[number % 2]["id"], f"好友{number * 2 + 1}", "今日火花"),
+                        saved_recipient(accounts[number % 2]["id"], f"好友{number * 2 + 2}", "今日火花"),
                     ],
                 },
             )
@@ -369,7 +383,7 @@ def test_account_limit_is_five_per_user():
         assert me["limits"]["recipients_total"] == 10
         sixth_plan = client.post(
             "/api/tasks",
-            json={"account_id": accounts[2]["id"], "name": "超额计划", "send_time": "09:17", "recipients": [{"contact_name": "好友11", "message": "今日火花"}]},
+            json={"account_id": accounts[2]["id"], "name": "超额计划", "send_time": "09:17", "recipients": [saved_recipient(accounts[2]["id"], "好友11", "今日火花")]},
         )
         assert sixth_plan.status_code == 409
         assert "合计最多创建 5 个计划" in sixth_plan.json()["detail"]
@@ -381,9 +395,9 @@ def test_account_limit_is_five_per_user():
                 "name": created_plans[0]["name"],
                 "send_time": created_plans[0]["send_time"],
                 "recipients": [
-                    {"contact_name": "好友1", "message": "今日火花"},
-                    {"contact_name": "好友2", "message": "今日火花"},
-                    {"contact_name": "好友11", "message": "今日火花"},
+                    saved_recipient(created_plans[0]["account_id"], "好友1", "今日火花"),
+                    saved_recipient(created_plans[0]["account_id"], "好友2", "今日火花"),
+                    saved_recipient(created_plans[0]["account_id"], "好友11", "今日火花"),
                 ],
             },
         )
@@ -405,7 +419,7 @@ def test_account_delete_cascades_and_is_tenant_scoped():
                 "account_id": account["id"],
                 "name": "随账号删除的计划",
                 "send_time": "06:31",
-                "recipients": [{"contact_name": "好友A", "message": "今日火花"}],
+                "recipients": [saved_recipient(account["id"], "好友A", "今日火花")],
             },
         )
         assert task.status_code == 201, task.text
@@ -434,7 +448,7 @@ def test_admin_can_manage_invites_and_regular_users_cannot():
                 "account_id": account["id"],
                 "name": "管理员晚间计划",
                 "send_time": "20:15",
-                "recipients": [{"contact_name": "好友甲", "message": "今日火花"}],
+                "recipients": [saved_recipient(account["id"], "好友甲", "今日火花")],
             },
         )
         assert plan.status_code == 201, plan.text
@@ -526,7 +540,7 @@ def test_schedule_recommendation_and_runs_are_grouped_by_beijing_date():
                 "account_id": account["id"],
                 "name": "日期分页计划",
                 "send_time": "20:05",
-                "recipients": [{"contact_name": "好友A", "message": "不应出现在邮件中"}],
+                "recipients": [saved_recipient(account["id"], "好友A", "不应出现在邮件中")],
             },
         ).json()
         user_id = client.get("/api/me").json()["id"]
@@ -561,11 +575,11 @@ def test_admin_can_page_all_account_runs_by_beijing_date():
         other_account_id = member.post("/api/accounts", json={"name": "其他账号"}).json()["id"]
         task_id = member.post("/api/tasks", json={
             "account_id": account_id, "name": "历史计划", "send_time": "20:00",
-            "recipients": [{"contact_name": "好友A", "message": "测试"}],
+            "recipients": [saved_recipient(account_id, "好友A", "测试")],
         }).json()["id"]
         other_task_id = member.post("/api/tasks", json={
             "account_id": other_account_id, "name": "其他计划", "send_time": "21:00",
-            "recipients": [{"contact_name": "好友B", "message": "测试"}],
+            "recipients": [saved_recipient(other_account_id, "好友B", "测试")],
         }).json()["id"]
         with SessionLocal() as db:
             db.get(User, admin_id).is_admin = True
@@ -598,9 +612,9 @@ def test_contacts_persist_selection_syncs_task_and_task_can_be_deleted():
         user_id = client.get("/api/me").json()["id"]
         account_id = client.post("/api/accounts", json={"name": "联系人测试号"}).json()["id"]
         with SessionLocal() as db:
-            friend = Contact(account_id=account_id, user_id=user_id, source_key="friend:小明", display_name="小明", conversation_type="friend", streak_days=18)
-            group = Contact(account_id=account_id, user_id=user_id, source_key="group:家人群", display_name="家人群", conversation_type="group")
-            unknown = Contact(account_id=account_id, user_id=user_id, source_key="unknown:未识别", display_name="未识别", conversation_type="unknown")
+            friend = Contact(account_id=account_id, user_id=user_id, source_key="friend:小明", external_id="conv:test:friend:小明", display_name="小明", conversation_type="friend", streak_days=18)
+            group = Contact(account_id=account_id, user_id=user_id, source_key="group:家人群", external_id="conv:test:group:家人群", display_name="家人群", conversation_type="group")
+            unknown = Contact(account_id=account_id, user_id=user_id, source_key="unknown:未识别", external_id="conv:test:unknown:未识别", display_name="未识别", conversation_type="unknown")
             db.add_all([friend, group, unknown])
             db.commit()
             friend_id, group_id = friend.id, group.id
@@ -668,8 +682,8 @@ def test_admin_can_create_multiple_contact_plans_without_duplicate_targets():
         with SessionLocal() as db:
             user = db.get(User, user_id)
             user.is_admin = True
-            first = Contact(account_id=account_id, user_id=user_id, source_key="friend:first", display_name="好友一", conversation_type="friend")
-            second = Contact(account_id=account_id, user_id=user_id, source_key="friend:second", display_name="好友二", conversation_type="friend")
+            first = Contact(account_id=account_id, user_id=user_id, source_key="friend:first", external_id="conv:test:friend:first", display_name="好友一", conversation_type="friend")
+            second = Contact(account_id=account_id, user_id=user_id, source_key="friend:second", external_id="conv:test:friend:second", display_name="好友二", conversation_type="friend")
             db.add_all([first, second])
             db.commit()
             first_id, second_id = first.id, second.id
@@ -750,7 +764,7 @@ def test_stale_in_flight_item_is_not_requeued():
         account_id = client.post("/api/accounts", json={"name": "中断保护号"}).json()["id"]
         task = client.post(
             "/api/tasks",
-            json={"account_id": account_id, "name": "中断保护计划", "send_time": "04:33", "recipients": [{"contact_name": "好友中断", "message": "今日火花"}]},
+            json={"account_id": account_id, "name": "中断保护计划", "send_time": "04:33", "recipients": [saved_recipient(account_id, "好友中断", "今日火花")]},
         ).json()
         with SessionLocal() as db:
             run = Run(

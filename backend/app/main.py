@@ -11,6 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import delete, func, inspect, or_, select
 from sqlalchemy.orm import Session
 
+from .identity import MISSING_ID, contact_for_recipient, snapshot_item, backfill_legacy_bindings, recent_contacts
+from .identity_schema import migrate_identity_schema
 from .config import get_settings
 from .database import Base, SessionLocal, engine, get_db
 from .mailer import enqueue_email
@@ -58,6 +60,7 @@ def _validate_configuration() -> None:
         raise RuntimeError("公网生产环境必须设置 SESSION_SECURE=true")
 
 
+
 def _seed_invite(db: Session) -> None:
     if not settings.bootstrap_invite:
         return
@@ -68,6 +71,7 @@ def _seed_invite(db: Session) -> None:
 
 
 def _migrate_schema() -> None:
+    migrate_identity_schema(engine)
     inspector = inspect(engine)
     if "tasks" in inspector.get_table_names():
         columns = {column["name"] for column in inspector.get_columns("tasks")}
@@ -187,6 +191,7 @@ async def lifespan(_app: FastAPI):
         _seed_invite(db)
         _backfill_entitlements(db)
         _repair_legacy_retrying_runs(db)
+        backfill_legacy_bindings(db)
         now = utcnow()
         db.execute(delete(LoginSession).where(LoginSession.expires_at <= now))
         db.execute(delete(PendingRegistration).where(PendingRegistration.code_expires_at <= now - timedelta(days=1)))
@@ -491,6 +496,7 @@ def _run_json(run: Run, db: Session) -> dict:
         "items": [
             {
                 "contact_name": item.contact_name,
+                "contact_id": item.contact_id,
                 "message": item.message,
                 "status": item.status,
                 "reason": item.reason,
@@ -994,6 +1000,11 @@ def _contact_json(contact: Contact) -> dict:
     return {
         "id": contact.id,
         "display_name": contact.display_name,
+        "douyin_id": contact.douyin_id,
+        "nickname": contact.nickname,
+        "remark_name": contact.remark_name,
+        "identity_ready": bool(contact.external_id and not contact.identity_conflict),
+        "identity_warning": None if contact.external_id and not contact.identity_conflict else MISSING_ID,
         "conversation_type": contact.conversation_type,
         "type_locked": contact.type_locked,
         "avatar_url": contact.avatar_url,
@@ -1009,16 +1020,12 @@ def list_saved_contacts(account_id: str, user: User = Depends(current_user), db:
     account = db.scalar(select(DouyinAccount).where(DouyinAccount.id == account_id, DouyinAccount.user_id == user.id))
     if not account:
         raise HTTPException(status_code=404, detail="抖音账号不存在")
-    contacts = db.scalars(
-        select(Contact)
-        .where(Contact.account_id == account_id, Contact.user_id == user.id)
-        .order_by(Contact.conversation_type, Contact.display_name)
-    ).all()
     latest_sync = db.scalar(
         select(ContactSync)
         .where(ContactSync.account_id == account_id, ContactSync.user_id == user.id, ContactSync.status == "complete")
         .order_by(ContactSync.finished_at.desc())
     )
+    contacts = recent_contacts(db, account_id, user.id, latest_sync.created_at if latest_sync else None)
     return {
         "contacts": [_contact_json(contact) for contact in contacts],
         "synced_at": latest_sync.finished_at if latest_sync else None,
@@ -1058,17 +1065,15 @@ def save_contact_selection(account_id: str, payload: ContactSelectionInput, user
     contacts_by_id = {contact.id: contact for contact in contacts}
     selected: list[tuple[Contact, str]] = []
     seen: set[str] = set()
-    selected_names: set[str] = set()
     for item in payload.recipients:
         contact = contacts_by_id.get(item.contact_id or "")
         if not contact:
             raise HTTPException(status_code=400, detail="所选联系人不存在或不属于当前抖音账号")
         if contact.id in seen:
             continue
-        if contact.display_name in selected_names:
-            raise HTTPException(status_code=409, detail="存在同名会话，暂时不能同时加入同一个计划")
+        if not contact.external_id or contact.identity_conflict:
+            raise HTTPException(status_code=409, detail=MISSING_ID)
         seen.add(contact.id)
-        selected_names.add(contact.display_name)
         selected.append((contact, item.message))
     for contact in contacts:
         contact.selected = False
@@ -1116,8 +1121,10 @@ def _task_json(task: Task) -> dict:
 
 def _task_recipients(payload: TaskCreate, account: DouyinAccount, user: User, db: Session, exclude_task_id: str | None = None) -> list[TaskRecipient]:
     recipients: list[TaskRecipient] = []
-    names: set[str] = set()
+    identities: set[str] = set()
     for item in payload.recipients:
+        if not item.contact_id:
+            raise HTTPException(status_code=409, detail="请从已同步好友中重新选择，不能仅凭昵称创建计划")
         contact = None
         if item.contact_id:
             contact = db.scalar(
@@ -1144,9 +1151,11 @@ def _task_recipients(payload: TaskCreate, account: DouyinAccount, user: User, db
             if db.scalar(duplicate_query):
                 raise HTTPException(status_code=409, detail=f"{contact.display_name} 已在当前账号的其他计划中")
         contact_name = contact.display_name if contact else item.contact_name.strip()
-        if contact_name in names:
-            raise HTTPException(status_code=409, detail="存在同名会话，暂时不能同时加入同一个计划")
-        names.add(contact_name)
+        if not contact or not contact.external_id or contact.identity_conflict:
+            raise HTTPException(status_code=409, detail=MISSING_ID)
+        if contact.external_id in identities:
+            raise HTTPException(status_code=409, detail="同一好友不能重复加入计划")
+        identities.add(contact.external_id)
         recipients.append(
             TaskRecipient(
                 contact_id=contact.id if contact else None,
@@ -1284,7 +1293,7 @@ def run_task_now(task_id: str, user: User = Depends(current_user), db: Session =
     if active:
         raise HTTPException(status_code=409, detail="该计划已有任务在队列中")
     run = Run(task_id=task.id, user_id=user.id, scheduled_for=utcnow())
-    run.items = [RunItem(contact_name=item.contact_name, message=item.message) for item in task.recipients if item.enabled]
+    run.items = [snapshot_item(db, task, item) for item in task.recipients if item.enabled]
     if not run.items:
         raise HTTPException(status_code=400, detail="执行计划没有可用好友")
     db.add(run)

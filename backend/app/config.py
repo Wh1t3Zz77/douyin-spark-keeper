@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     bootstrap_invite: str = ""
     bootstrap_invite_uses: int = 20
     admin_email: str = ""
+    task_failure_admin_email: str = ""
     smtp_host: str = ""
     smtp_port: int = 465
     smtp_username: str = ""

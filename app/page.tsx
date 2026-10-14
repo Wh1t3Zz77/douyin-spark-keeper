@@ -40,6 +40,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
+import { todaySentKeys } from '@/lib/today-sent';
 
 const nav = [
   { label: '总览', icon: Home },
@@ -53,11 +54,46 @@ const nav = [
 
 const API_BASE =
   process.env.NODE_ENV === 'development' ? 'http://localhost:8000' : '';
+const ICP_NUMBER = process.env.NEXT_PUBLIC_ICP_NUMBER || '';
+const PUBLIC_SECURITY_NUMBER =
+  process.env.NEXT_PUBLIC_PUBLIC_SECURITY_NUMBER || '';
+const PUBLIC_SECURITY_CODE = PUBLIC_SECURITY_NUMBER.replace(/\D/g, '');
 
 function SiteFooter() {
   return (
     <footer className="px-4 py-5 text-center text-[11px] leading-5 text-[#8e887f]">
       <span>火花值守 · 社区自托管版</span>
+      {ICP_NUMBER && (
+        <div className="mt-1">
+          <a
+            href="https://beian.miit.gov.cn/"
+            target="_blank"
+            rel="noreferrer"
+            className="transition hover:text-[#d95739]"
+          >
+            {ICP_NUMBER}
+          </a>
+        </div>
+      )}
+      {PUBLIC_SECURITY_NUMBER && /^\d{14}$/.test(PUBLIC_SECURITY_CODE) && (
+        <div className="mt-1">
+          <a
+            href={`https://beian.mps.gov.cn/#/query/webSearch?code=${PUBLIC_SECURITY_CODE}`}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-1 whitespace-nowrap transition hover:text-[#d95739]"
+          >
+            <img
+              src="/police-filing.png"
+              alt="公安备案图标"
+              width={18}
+              height={20}
+              className="h-5 w-[18px] shrink-0"
+            />
+            <span>{PUBLIC_SECURITY_NUMBER}</span>
+          </a>
+        </div>
+      )}
     </footer>
   );
 }
@@ -123,6 +159,7 @@ type TaskInfo = {
   recipients: RecipientInfo[];
 };
 type RunItemInfo = {
+  contact_id?: string | null;
   contact_name: string;
   message: string;
   status: string;
@@ -159,6 +196,11 @@ type QueueInfo = {
   running: boolean;
 };
 type ContactInfo = {
+  douyin_id?: string | null;
+  nickname?: string | null;
+  remark_name?: string | null;
+  identity_ready?: boolean;
+  identity_warning?: string | null;
   id: string;
   display_name: string;
   conversation_type: ConversationType;
@@ -296,6 +338,7 @@ const runStatusText: Record<string, string> = {
   needs_account: '账号未就绪',
   security_challenge: '需要安全验证',
   needs_review: '结果待确认',
+  needs_selection: '请重新选择好友',
   sending: '正在发送',
   submitted: '已发送',
   skipped: '已跳过',
@@ -604,6 +647,7 @@ export default function HomePage() {
   const [selectedRecipients, setSelectedRecipients] = useState<
     RecipientDraft[]
   >([]);
+  const [contactSearch, setContactSearch] = useState('');
   const [contactFilter, setContactFilter] = useState<'all' | ConversationType>(
     'all',
   );
@@ -695,9 +739,18 @@ export default function HomePage() {
     runDateIndex >= 0 ? runDates[runDateIndex + 1] : undefined;
   const newerRunDate =
     runDateIndex > 0 ? runDates[runDateIndex - 1] : undefined;
+  const contactQuery = contactSearch.trim().toLocaleLowerCase();
   const filteredContacts = contacts.filter(
     (contact) =>
-      contactFilter === 'all' || contact.conversation_type === contactFilter,
+      (contactFilter === 'all' ||
+        contact.conversation_type === contactFilter) &&
+      (!contactQuery ||
+        [
+          contact.display_name,
+          contact.nickname,
+          contact.remark_name,
+          contact.douyin_id,
+        ].some((value) => value?.toLocaleLowerCase().includes(contactQuery))),
   );
   const visibleFilteredContacts = contactsExpanded
     ? filteredContacts
@@ -1020,6 +1073,7 @@ export default function HomePage() {
     setContactsSyncedAt(null);
     setContactsDirty(false);
     setContactSync(null);
+    setContactSearch('');
     if (selectedAccountId) void loadSavedContacts(selectedAccountId);
     setSelectedTaskId('');
     return () => contactsAbortRef.current?.abort();
@@ -1064,13 +1118,10 @@ export default function HomePage() {
         primaryTask.recipients
           .filter((item) => item.enabled)
           .map((item) => ({
-            contact_id:
-              item.contact_id ||
-              contacts.find(
-                (contact) => contact.display_name === item.contact_name,
-              )?.id ||
-              '',
-            contact_name: item.contact_name,
+            contact_id: item.contact_id || '',
+            contact_name:
+              contacts.find((contact) => contact.id === item.contact_id)
+                ?.display_name || item.contact_name,
             conversation_type: item.conversation_type,
             message: item.message,
           })),
@@ -1149,6 +1200,15 @@ export default function HomePage() {
   };
 
   const toggleContact = (contact: ContactInfo) => {
+    if (
+      contact.identity_ready === false &&
+      !selectedRecipients.some((item) => item.contact_id === contact.id)
+    ) {
+      showNotice(
+        contact.identity_warning || '缺少稳定好友标识，请重新同步好友后选择',
+      );
+      return;
+    }
     setSelectedRecipients((current) => {
       if (current.some((item) => item.contact_id === contact.id))
         return current.filter((item) => item.contact_id !== contact.id);
@@ -1779,8 +1839,9 @@ export default function HomePage() {
 
   if (!authReady) {
     return (
-      <main className="grid min-h-screen place-items-center bg-[#eef1f6] text-sm text-[#7b8491]">
-        正在安全连接…
+      <main className="flex min-h-screen flex-col bg-[#eef1f6] text-sm text-[#7b8491]">
+        <div className="grid flex-1 place-items-center">正在安全连接…</div>
+        <SiteFooter />
       </main>
     );
   }
@@ -2065,14 +2126,23 @@ export default function HomePage() {
     ? [...nav, { label: '我的管理', icon: ShieldCheck }]
     : nav;
   const mobilePrimaryNav = visibleNav.slice(0, 4);
-  const plannedFriends =
-    primaryTask?.recipients.filter((item) => item.enabled) || [];
+  const plannedFriends = (
+    primaryTask?.recipients.filter((item) => item.enabled) || []
+  ).map((item) => ({
+    ...item,
+    contact_name:
+      contacts.find((contact) => contact.id === item.contact_id)
+        ?.display_name || item.contact_name,
+  }));
   const enabledAccountTasks = accountTasks.filter((task) => task.enabled);
   const allPlannedFriends = accountTasks.flatMap((task) =>
     task.recipients
       .filter((item) => item.enabled)
       .map((item) => ({
         ...item,
+        contact_name:
+          contacts.find((contact) => contact.id === item.contact_id)
+            ?.display_name || item.contact_name,
         task_id: task.id,
         task_name: task.name,
         send_time: task.send_time,
@@ -2129,22 +2199,17 @@ export default function HomePage() {
         hour12: false,
       }).format(nextRun)
     : '尚未安排';
-  const todayItemByRecipient = new Map<string, RunItemInfo>();
-  todayAccountRuns.forEach((run) =>
-    run.items.forEach((item) => {
-      const key = `${run.task_id}:${item.contact_name}`;
-      if (!todayItemByRecipient.has(key)) todayItemByRecipient.set(key, item);
-    }),
-  );
-  const todaySentFriends = allPlannedFriends.filter(
-    (friend) =>
-      todayItemByRecipient.get(`${friend.task_id}:${friend.contact_name}`)
-        ?.status === 'submitted',
+  const todaySent = todaySentKeys(accountTasks, todayAccountRuns, contacts);
+  const todaySentFriends = allPlannedFriends.filter((friend) =>
+    todaySent.has(
+      `${friend.task_id}:${friend.contact_id || friend.contact_name}`,
+    ),
   );
   const todayUnsentFriends = allPlannedFriends.filter(
     (friend) =>
-      todayItemByRecipient.get(`${friend.task_id}:${friend.contact_name}`)
-        ?.status !== 'submitted',
+      !todaySent.has(
+        `${friend.task_id}:${friend.contact_id || friend.contact_name}`,
+      ),
   );
 
   return (
@@ -2964,6 +3029,19 @@ export default function HomePage() {
                         : '新计划未创建'}
                   </span>
                 </div>
+                <Input
+                  aria-label="搜索已同步好友"
+                  placeholder="搜索昵称、备注或抖音号"
+                  value={contactSearch}
+                  onChange={(event) => {
+                    setContactSearch(event.target.value);
+                    setContactsExpanded(false);
+                  }}
+                  className="mt-3 h-10 rounded-xl bg-white"
+                />
+                <p className="mt-1 text-[10px] text-[#938c83]">
+                  仅搜索已同步会话；未显示抖音号时，请重新同步，抖音未提供的号码暂不可检索。
+                </p>
                 <div className="mt-3 flex flex-wrap gap-2">
                   {accountTasks.map((task, index) => (
                     <button
@@ -3068,6 +3146,16 @@ export default function HomePage() {
                                     ? `火花 ${contact.streak_days} 天`
                                     : '未安排'}
                               </span>
+                              {contact.douyin_id && (
+                                <span className="mt-0.5 block truncate text-[10px] text-[#938c83]">
+                                  抖音号：{contact.douyin_id}
+                                </span>
+                              )}
+                              {contact.identity_ready === false && (
+                                <span className="mt-1 block text-[10px] text-[#c05b3d]">
+                                  缺少稳定标识，请重新同步
+                                </span>
+                              )}
                             </span>
                           </button>
                           <select
@@ -3091,7 +3179,9 @@ export default function HomePage() {
                   ) : (
                     <div className="grid place-items-center rounded-xl border border-dashed border-black/10 px-4 py-8 text-center text-xs leading-5 text-[#8e887f] sm:col-span-2 xl:col-span-3">
                       {contacts.length
-                        ? '当前分类中没有会话。'
+                        ? contactQuery
+                          ? '没有匹配的已同步好友。'
+                          : '当前分类中没有会话。'
                         : selectedAccount?.status === 'valid'
                           ? '点击“同步最近会话”，读取完成后会自动保存并在刷新后恢复。'
                           : '请先到“账号绑定”完成当前抖音账号的扫码登录。'}
@@ -3129,6 +3219,21 @@ export default function HomePage() {
                           <div className="mt-1 text-[10px] text-[#8e887f]">
                             {conversationLabel[recipient.conversation_type]}
                           </div>
+                          <button
+                            type="button"
+                            aria-label={`移除${recipient.contact_name}`}
+                            onClick={() => {
+                              setSelectedRecipients((current) =>
+                                current.filter(
+                                  (_, itemIndex) => itemIndex !== index,
+                                ),
+                              );
+                              setContactsDirty(true);
+                            }}
+                            className="mt-1 text-[10px] text-[#c05b3d]"
+                          >
+                            移除
+                          </button>
                         </div>
                         <Input
                           aria-label={`${recipient.contact_name}的消息`}
@@ -3142,6 +3247,16 @@ export default function HomePage() {
                       </div>
                     ))}
                   </div>
+                )}
+                {primaryTask?.recipients.some(
+                  (item) =>
+                    !item.contact_id ||
+                    contacts.find((contact) => contact.id === item.contact_id)
+                      ?.identity_ready === false,
+                ) && (
+                  <p className="mt-3 text-xs text-[#c05b3d]">
+                    计划中有好友缺少稳定标识或无法唯一确认，请重新同步后重新选择并保存。系统不会仅凭旧昵称发送。
+                  </p>
                 )}
                 <Button
                   onClick={saveContactSelection}

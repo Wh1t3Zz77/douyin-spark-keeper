@@ -143,6 +143,13 @@ class Contact(Base):
     conversation_type: Mapped[str] = mapped_column(String(16), default="unknown", index=True)
     type_locked: Mapped[bool] = mapped_column(Boolean, default=False)
     external_id: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    uid: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    sec_uid: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    conversation_id: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    douyin_id: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    nickname: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    remark_name: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    identity_conflict: Mapped[bool] = mapped_column(Boolean, default=False)
     avatar_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     streak_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
     selected: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -176,7 +183,7 @@ class TaskRecipient(Base):
     conversation_type: Mapped[str] = mapped_column(String(16), default="unknown")
     message: Mapped[str] = mapped_column(String(500), default="今日火花")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    __table_args__ = (UniqueConstraint("task_id", "contact_name", name="uq_task_contact"),)
+    __table_args__ = (UniqueConstraint("task_id", "contact_id", name="uq_task_contact_identity"),)
 
 
 class Run(Base):
@@ -200,6 +207,9 @@ class RunItem(Base):
     __tablename__ = "run_items"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
     run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), index=True)
+    recipient_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    contact_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    external_id: Mapped[str | None] = mapped_column(String(240), nullable=True)
     contact_name: Mapped[str] = mapped_column(String(120))
     message: Mapped[str] = mapped_column(String(500))
     status: Mapped[str] = mapped_column(String(32), default="pending")
