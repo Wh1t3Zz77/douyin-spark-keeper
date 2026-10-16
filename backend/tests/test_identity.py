@@ -204,6 +204,7 @@ def test_legacy_pending_item_with_same_names_blocks(db):
 def test_retry_copies_identity_snapshot(db):
     c=contact(db); t=task(db,contact=c); run=Run(task_id=t.id,user_id='u',scheduled_for=utcnow(),attempt=1)
     run.items=[snapshot_item(db,t,t.recipients[0])]; db.add(run); db.flush()
+    for item in run.items: item.status='failed'
     worker._create_retry(db,run,run.items); db.flush()
     retry=db.scalar(select(Run).where(Run.parent_run_id==run.id))
     assert retry.items[0].contact_id == c.id

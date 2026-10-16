@@ -152,6 +152,7 @@ def claim_one() -> str | None:
                     failure_email_body(db, item, item.error_message),
                     "task_failed",
                 )
+            _settle_retry_ancestors(db, item)
         if stale:
             db.commit()
         expired_pending = db.scalars(select(Run).where(Run.status == "pending", Run.scheduled_for <= now)).all()
@@ -364,6 +365,8 @@ def failure_email_subject(db, run: Run, suffix: str) -> str:
 
 
 def _create_retry(db, run: Run, items: list[RunItem]) -> None:
+    if not items or any(item.status != "failed" for item in items):
+        raise ValueError("A retry requires confirmed failed items")
     retry = Run(
         task_id=run.task_id,
         user_id=run.user_id,
@@ -475,6 +478,7 @@ def execute_run(run_id: str) -> None:
         if not run:
             return
         if cancel_expired_run(db, run):
+            _settle_retry_ancestors(db, run)
             db.commit()
             return
         task = db.get(Task, run.task_id)
@@ -487,8 +491,19 @@ def execute_run(run_id: str) -> None:
             run.error_message = "抖音账号尚未完成扫码绑定或登录已失效"
             run.finished_at = utcnow()
             notify_failure(db, run, failure_email_subject(db, run, "需要重新绑定"), failure_email_body(db, run, "自动任务未执行，因为抖音账号尚未绑定或登录已失效。"), "login_expired")
+            _settle_retry_ancestors(db, run)
             db.commit()
             return
+        if not run.items:
+            run.status = "failed"
+            run.error_code = "EMPTY_RUN"
+            run.error_message = "运行明细为空，未执行发送"
+            run.finished_at = utcnow()
+            notify_failure(db, run, failure_email_subject(db, run, "任务未完成"), failure_email_body(db, run, run.error_message), "task_failed")
+            _settle_retry_ancestors(db, run)
+            db.commit()
+            return
+        logger.info("run started: run=%s attempt=%s items=%s", run.id, run.attempt, len(run.items))
         recipients = []
         for item in run.items:
             if item.status != "pending":
@@ -510,6 +525,7 @@ def execute_run(run_id: str) -> None:
             run.error_message = "保存的登录状态无法解密，请重新扫码绑定"
             run.finished_at = utcnow()
             notify_failure(db, run, failure_email_subject(db, run, "需要重新绑定"), failure_email_body(db, run, "保存的抖音登录状态无法读取，请重新扫码绑定。"), "login_expired")
+            _settle_retry_ancestors(db, run)
             db.commit()
             return
 
@@ -558,16 +574,27 @@ def execute_run(run_id: str) -> None:
                     item.status = "uncertain"
                     item.reason = "发送后未能保存确认结果；为避免重复未自动重试"
                 elif item.status == "pending":
-                    item.status = "skipped"
-                    item.reason = "批次因账号或安全状态停止"
+                    if fatal.startswith(("logged_out:", "security_challenge:")):
+                        item.status = "skipped"
+                        item.reason = "批次因账号或安全状态停止"
+                    else:
+                        item.status = "failed"
+                        item.reason = "浏览器页面或连接异常，未开始发送"
+                item.finished_at = item.finished_at or utcnow()
+            elif item.status in {"pending", "sending"}:
+                item.status, item.reason = (
+                    ("uncertain", "浏览器未返回确认结果；为避免重复未自动重试")
+                    if item.status == "sending" else
+                    ("failed", "浏览器未处理该明细，未开始发送")
+                )
                 item.finished_at = item.finished_at or utcnow()
         run.finished_at = utcnow()
 
-        if fatal and fatal.startswith("transient:"):
+        if fatal and not fatal.startswith(("logged_out:", "security_challenge:")):
             for item in run.items:
                 if item.status == "pending":
                     item.status = "failed"
-                    item.reason = fatal.split(":", 1)[1]
+                    item.reason = fatal.partition(":")[2] or fatal
             uncertain = [item for item in run.items if item.status == "uncertain"]
             failed = [item for item in run.items if item.status == "failed"]
             if any(item.status == "needs_selection" for item in run.items):
@@ -579,13 +606,15 @@ def execute_run(run_id: str) -> None:
                 run.error_code = "DELIVERY_UNCERTAIN"
                 run.error_message = "服务异常时部分发送结果无法确认，为避免重复没有自动重试"
                 notify_failure(db, run, failure_email_subject(db, run, "发送结果待确认"), failure_email_body(db, run, run.error_message), "task_failed")
-            elif run.attempt < 3 and entitlement_is_active(db, run.user_id):
+            elif all(item.status == "submitted" for item in run.items):
+                run.status = "success"
+            elif failed and run.attempt < 3 and entitlement_is_active(db, run.user_id):
                 _create_retry(db, run, failed)
             else:
                 run.status = "failed"
-                run.error_code = "RETRIES_EXHAUSTED"
-                run.error_message = "浏览器执行连续失败 3 次"
-                notify_failure(db, run, failure_email_subject(db, run, "连续失败 3 次"), failure_email_body(db, run, "自动执行连续尝试 3 次仍未完成，已停止重试。"), "task_failed")
+                run.error_code = "RETRIES_EXHAUSTED" if run.attempt >= 3 else "BROWSER_EXECUTION_FAILED"
+                run.error_message = "浏览器执行连续失败 3 次" if run.attempt >= 3 else "浏览器任务未完成，已停止重试"
+                notify_failure(db, run, failure_email_subject(db, run, "任务未完成"), failure_email_body(db, run, run.error_message), "task_failed")
         elif fatal and fatal.startswith("logged_out:"):
             account.status = "invalid"
             run.status = "needs_login"
@@ -660,6 +689,7 @@ def settle_interrupted_run(run_id: str, error_code: str) -> None:
             failure_email_body(db, run, run.error_message),
             "task_failed",
         )
+        _settle_retry_ancestors(db, run)
         db.commit()
 
 

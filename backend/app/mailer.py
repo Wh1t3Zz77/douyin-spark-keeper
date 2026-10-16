@@ -1,4 +1,5 @@
 import smtplib
+import logging
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 
@@ -10,6 +11,7 @@ from .models import EmailOutbox, utcnow
 
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 
 def enqueue_email(
@@ -62,10 +64,13 @@ def process_outbox(db: Session, limit: int = 10) -> int:
             item.status = "sent"
             item.last_error = None
             sent += 1
+            logger.info("SMTP accepted email: id=%s prior_failures=%s", item.id, item.attempts)
         except Exception as exc:
             item.attempts += 1
             item.last_error = str(exc)[:500]
             item.status = "failed" if item.attempts >= 5 else "retry"
             item.next_attempt_at = now + timedelta(minutes=min(60, 2 ** item.attempts))
+            logger.warning("SMTP delivery failed: id=%s attempt=%s error_type=%s smtp_code=%s status=%s next_attempt_at=%s",
+                item.id, item.attempts, type(exc).__name__, getattr(exc, "smtp_code", None), item.status, item.next_attempt_at.isoformat())
     db.commit()
     return sent

@@ -66,6 +66,19 @@ BROWSER_ARGS = ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-u
 BROWSER_ARGS += ["--disk-cache-size=16777216", "--media-cache-size=8388608"]
 PROFILE_ROOT = os.getenv("DOUYIN_PROFILE_ROOT", "/app/data/browser-profiles")
 LOGGER = logging.getLogger(__name__)
+CONTACT_LOOKUP_TIMEOUT_SECONDS = 45
+CONVERSATION_MATCHES = r"""(titles, expected) => {
+    const read = IDENTITY_FUNCTION;
+    return titles.slice(0, 100).flatMap((title, index) => {
+        if (!title.getClientRects().length || getComputedStyle(title).visibility === 'hidden') return [];
+        const identity = read(title);
+        const fields = {'conv:': 'conversation_id', 'sec:': 'sec_uid', 'uid:': 'uid'};
+        for (const [prefix, field] of Object.entries(fields)) {
+            if (expected.startsWith(prefix)) return String(identity[field] || '') === expected.slice(prefix.length) ? [index] : [];
+        }
+        return ['conversation_id', 'uid', 'sec_uid'].some(field => String(identity[field] || '') === expected) ? [index] : [];
+    });
+}""".replace("IDENTITY_FUNCTION", IDENTITY_READER)
 
 
 @dataclass
@@ -690,7 +703,7 @@ def list_contacts(storage_state_json: str, profile_key: str | None = None) -> tu
 
 def _locator_identity(locator) -> dict:
     try:
-        return locator.evaluate(IDENTITY_READER) or {}
+        return locator.evaluate(IDENTITY_READER, timeout=5000) or {}
     except Exception:
         return {}
 
@@ -710,26 +723,30 @@ def _verify_conversation(page: Page, external_id: str) -> bool:
 def _find_conversation_title(page: Page, name: str, external_id: str | None = None):
     if not external_id:
         return None
-    def current_match():
-        matches = []
-        titles = page.locator(".conversationConversationItemtitle")
-        for index in range(min(titles.count(), 100)):
-            title = titles.nth(index)
-            if title.is_visible() and identity_matches(_locator_identity(title), external_id):
-                matches.append((title, (title.inner_text() or "").strip()))
-        return matches[0] if len(matches) == 1 else None
+    started = time.monotonic()
+    deadline = started + CONTACT_LOOKUP_TIMEOUT_SECONDS
     try:
+        titles = page.locator(".conversationConversationItemtitle")
         page.mouse.move(190, 500)
         page.mouse.wheel(0, -12000)
         page.wait_for_timeout(700)
         for _ in range(32):
-            match = current_match()
-            if match:
-                return match
+            if time.monotonic() >= deadline:
+                break
+            # A single DOM snapshot avoids hundreds of locator round trips and
+            # per-row waits against recycled virtual-list elements.
+            matches = titles.evaluate_all(CONVERSATION_MATCHES, external_id)
+            if len(matches) > 1:
+                return None
+            if len(matches) == 1 and time.monotonic() < deadline:
+                return titles.nth(matches[0]), name
+            if time.monotonic() >= deadline:
+                break
             page.mouse.wheel(0, 650)
-            page.wait_for_timeout(450)
+            page.wait_for_timeout(min(450, max(1, int((deadline-time.monotonic())*1000))))
     except Exception:
-        pass
+        LOGGER.warning("conversation lookup failed; elapsed_seconds=%.1f", time.monotonic()-started)
+    LOGGER.info("conversation lookup ended without a unique identity; elapsed_seconds=%.1f", time.monotonic()-started)
     return None
 
 
@@ -754,16 +771,19 @@ def _open_contact(page: Page, name: str, external_id: str | None = None) -> bool
 def _send_one(page: Page, name: str, message: str, external_id: str | None = None) -> SendResult:
     if not external_id:
         return SendResult(name, "needs_selection", "缺少稳定好友标识，请重新同步好友并重新选择")
+    LOGGER.info("browser phase=conversation_lookup")
     if not _open_contact(page, name, external_id):
         return SendResult(name, "failed", "找不到好友或无法确认会话标题")
     challenge = security_challenge(page)
     if challenge:
         return SendResult(name, "security_challenge", challenge)
     box = page.locator('div[contenteditable="true"]').first
+    submission_started = False
     try:
+        LOGGER.info("browser phase=message_input")
         if not box.count() or not box.is_visible():
             return SendResult(name, "failed", "找不到聊天输入框")
-        box.click()
+        box.click(timeout=5000)
         page.keyboard.press("Control+A")
         page.keyboard.press("Delete")
         page.keyboard.type(message, delay=90)
@@ -775,6 +795,8 @@ def _send_one(page: Page, name: str, message: str, external_id: str | None = Non
             page.keyboard.press("Control+A")
             page.keyboard.press("Delete")
             return SendResult(name, "failed", "发送前会话身份校验失败，已停止发送")
+        LOGGER.info("browser phase=message_submit")
+        submission_started = True
         page.keyboard.press("Enter")
         deadline = time.time() + 8
         while time.time() < deadline:
@@ -783,6 +805,8 @@ def _send_one(page: Page, name: str, message: str, external_id: str | None = Non
                 return SendResult(name, "submitted")
         return SendResult(name, "uncertain", "发送后状态无法确认；为避免重复，不自动重试")
     except Exception as exc:
+        if submission_started:
+            return SendResult(name, "uncertain", "提交发送时浏览器响应异常，结果无法确认；为避免重复未自动重试")
         return SendResult(name, "failed", f"发送异常：{str(exc)[:180]}")
 
 
@@ -808,7 +832,8 @@ def send_batch(
                 timezone_id="Asia/Shanghai",
             )
             page = _context_page(context)
-            page.goto(CHAT_URL, timeout=90000, wait_until="domcontentloaded")
+            LOGGER.info("browser phase=chat_navigation")
+            page.goto(CHAT_URL, timeout=45000, wait_until="commit")
             page.wait_for_timeout(7000)
             logged, reason = login_state(page)
             if not logged:
@@ -828,6 +853,7 @@ def send_batch(
                 external_id = recipient[2] if len(recipient) > 2 else None
                 if on_before_send:
                     on_before_send(recipient[3] if len(recipient) > 3 else name)
+                LOGGER.info("browser item started: item=%s", recipient[3] if len(recipient) > 3 else "legacy")
                 result = _send_one(page, name, message, external_id)
                 result.item_id = recipient[3] if len(recipient) > 3 else None
                 if on_result:
