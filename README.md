@@ -91,6 +91,8 @@ docker compose logs --tail=100
 
 浏览器只访问一个入口端口。内置 Caddy 将 `/api/*` 转发给 FastAPI，其余请求转发给前端，因此本机和局域网部署不需要额外安装 Nginx，也不存在前端与 API 端口不一致的问题。
 
+前端构建为静态文件，运行时由轻量文件服务器提供，不常驻 Node。worker 保留单浏览器执行、持续内存压力保护和 1200 秒总超时；Compose 默认每批发送后回收 worker 容器，清理浏览器残留进程。
+
 ```text
 浏览器 -> gateway:3000 -> frontend:3000
                        -> api:8000 -> SQLite 数据卷

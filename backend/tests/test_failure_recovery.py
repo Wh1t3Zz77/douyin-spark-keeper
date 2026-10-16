@@ -121,7 +121,7 @@ def test_empty_run_is_terminal_and_notifies(recovery_db,monkeypatch):
     send.assert_not_called()
 
 
-@pytest.mark.parametrize('error_code',['RUN_TIMEOUT','WORKER_EXITED'])
+@pytest.mark.parametrize('error_code',['RUN_TIMEOUT','WORKER_EXITED','RUN_RESOURCE_PRESSURE'])
 def test_interruption_settles_all_retry_ancestors_once(recovery_db,error_code):
     db=recovery_db;root=seed(db);root.status='retrying'
     middle=Run(task_id=root.task_id,user_id=root.user_id,scheduled_for=utcnow(),status='retrying',parent_run_id=root.id,attempt=2)
@@ -239,3 +239,106 @@ def test_smtp_retry_logs_survive_success_without_private_details(recovery_db,mon
     mailer.process_outbox(db)
     assert item.status=='sent' and item.last_error is None
     assert 'SMTP accepted email' in caplog.text and 'smtp_code=451' in caplog.text
+
+
+def test_send_asset_filter_keeps_chat_scripts_data_and_identity():
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+    from playwright.sync_api import Error, sync_playwright
+    seen=[]
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append(self.path)
+            if self.path=='/':
+                body=b'''<script src="/chat.js"></script><img src="/large.png">
+                <video src="/large.mp4" preload="auto"></video>
+                <div class="conversationConversationItemtitle" id="friend">same</div>
+                <div contenteditable="true">text control</div>'''
+                kind='text/html'
+            elif self.path=='/chat.js':
+                body=b"window.chatReady=true; fetch('/chat-data').then(r=>r.text()).then(x=>window.chatData=x)"
+                kind='application/javascript'
+            else:body=b'synthetic';kind='text/plain'
+            self.send_response(200);self.send_header('Content-Type',kind);self.end_headers();self.wfile.write(body)
+        def log_message(self,*args):pass
+    server=ThreadingHTTPServer(('127.0.0.1',0),Handler)
+    thread=Thread(target=server.serve_forever,daemon=True);thread.start()
+    try:
+        with sync_playwright() as p:
+            try:
+                browser=p.chromium.launch(headless=True,executable_path=os.environ.get('TEST_BROWSER_EXECUTABLE'),args=['--no-sandbox','--disable-dev-shm-usage'])
+            except Error as exc:
+                if "Executable doesn't exist" in str(exc):pytest.skip('Playwright Chromium is not installed')
+                raise
+            context=browser.new_context();douyin._limit_send_assets(context)
+            page=context.new_page();blocked=[]
+            page.on('requestfailed',lambda request:blocked.append(request.resource_type))
+            page.goto(f'http://127.0.0.1:{server.server_port}/')
+            page.wait_for_function("window.chatReady && window.chatData === 'synthetic'")
+            page.wait_for_function("document.querySelector('video').error !== null")
+            page.evaluate("document.querySelector('#friend').__reactFiber$test={memoizedProps:{conversation:{id:'stable'}}}")
+            assert page.locator('.conversationConversationItemtitle').evaluate_all(douyin.CONVERSATION_MATCHES,'conv:stable')==[0]
+            page.locator('[contenteditable]').fill('synthetic message')
+            assert page.locator('[contenteditable]').inner_text()=='synthetic message'
+            assert {'image','media'} <= set(blocked)
+            assert '/chat.js' in seen and '/chat-data' in seen
+            assert '/large.png' not in seen and '/large.mp4' not in seen
+            browser.close()
+    finally:
+        server.shutdown();server.server_close();thread.join(timeout=2)
+
+
+@pytest.mark.parametrize('full,available,expected',[(45,240000,True),(0,90000,True),(0,500000,False)])
+def test_memory_guard_detects_stalls_even_with_available_memory(monkeypatch,full,available,expected):
+    def read(path):
+        if path.name=='memory':return f'some avg10=50 avg60=1 avg300=1 total=1\nfull avg10={full} avg60=1 avg300=1 total=1'
+        return f'MemAvailable: {available} kB\n'
+    monkeypatch.setattr(worker.Path,'read_text',read)
+    assert worker._host_memory_under_pressure() is expected
+
+
+def test_pressure_monitor_requires_consecutive_samples(monkeypatch):
+    process=Mock();process.args=['synthetic']
+    timeout=lambda:worker.subprocess.TimeoutExpired('synthetic',2)
+    process.wait.side_effect=[timeout(),timeout(),timeout(),timeout(),timeout(),0]
+    monkeypatch.setattr(worker,'_host_memory_under_pressure',Mock(side_effect=[True,True,False,True,True]))
+    assert worker._wait_for_run_process(process)==0
+
+
+def test_pressure_monitor_stops_before_hard_deadline_and_settles(monkeypatch,recovery_db):
+    db=recovery_db;run=seed(db);run.items[0].status='sending';db.commit()
+    process=Mock();process.args=['synthetic']
+    process.wait.side_effect=worker.subprocess.TimeoutExpired('synthetic',2)
+    monkeypatch.setattr(worker.subprocess,'Popen',Mock(return_value=process))
+    monkeypatch.setattr(worker,'_host_memory_under_pressure',lambda:True)
+    stop=Mock(return_value=True);monkeypatch.setattr(worker,'_stop_run_process_group',stop)
+    worker.execute_run_isolated(run.id);db.expire_all()
+    assert process.wait.call_count==3
+    stop.assert_called_once_with(process)
+    assert db.get(Run,run.id).error_code=='RUN_RESOURCE_PRESSURE'
+    assert sorted(i.status for i in db.get(Run,run.id).items)==['skipped','uncertain']
+    assert len(db.scalars(select(EmailOutbox)).all())==2
+
+
+def test_pressure_monitor_preserves_overall_timeout(monkeypatch):
+    process=Mock();process.args=['synthetic']
+    process.wait.side_effect=worker.subprocess.TimeoutExpired('synthetic',2)
+    monkeypatch.setattr(worker,'RUN_TIMEOUT_SECONDS',4)
+    monkeypatch.setattr(worker,'time',SimpleNamespace(monotonic=Mock(side_effect=[0,0,2,4])))
+    monkeypatch.setattr(worker,'_host_memory_under_pressure',lambda:False)
+    with pytest.raises(worker.subprocess.TimeoutExpired):worker._wait_for_run_process(process)
+    assert process.wait.call_count==2
+
+
+@pytest.mark.parametrize('supervisor_error',[False,True])
+def test_configured_worker_recycles_after_one_browser_run(monkeypatch,supervisor_error):
+    monkeypatch.setenv('SPARK_RECYCLE_AFTER_RUN','1')
+    monkeypatch.setattr(worker.Base.metadata,'create_all',Mock())
+    monkeypatch.setattr(worker,'schedule_due_tasks',Mock())
+    monkeypatch.setattr(worker,'process_daily_notifications',Mock())
+    monkeypatch.setattr(worker,'_host_memory_under_pressure',lambda:False)
+    claim=Mock(return_value='synthetic-run');monkeypatch.setattr(worker,'claim_one',claim)
+    execute=Mock(side_effect=RuntimeError('synthetic supervisor error') if supervisor_error else None)
+    monkeypatch.setattr(worker,'execute_run_isolated',execute)
+    worker.main()
+    claim.assert_called_once();execute.assert_called_once_with('synthetic-run')

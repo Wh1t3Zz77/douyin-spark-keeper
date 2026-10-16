@@ -8,14 +8,8 @@ ARG NEXT_PUBLIC_PUBLIC_SECURITY_NUMBER=""
 ENV NEXT_PUBLIC_ICP_NUMBER=$NEXT_PUBLIC_ICP_NUMBER
 ENV NEXT_PUBLIC_PUBLIC_SECURITY_NUMBER=$NEXT_PUBLIC_PUBLIC_SECURITY_NUMBER
 RUN npm run build
-RUN npm prune --omit=dev
 
-FROM node:22-bookworm-slim
-WORKDIR /app
-ENV NODE_ENV=production
-COPY --from=build /app/package.json ./
-COPY --from=build /app/package-lock.json ./
-COPY --from=build /app/node_modules ./node_modules
-COPY --from=build /app/dist ./dist
+FROM caddy:2.10-alpine
+COPY --from=build /app/dist/client /srv
+COPY deploy/Caddyfile.frontend /etc/caddy/Caddyfile
 EXPOSE 3000
-CMD ["npx", "vinext", "start", "--hostname", "0.0.0.0", "--port", "3000"]

@@ -39,9 +39,10 @@ services:
       test:
         [
           'CMD',
-          'node',
-          '-e',
-          "fetch('http://127.0.0.1:3000/').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))",
+          'wget',
+          '-q',
+          '--spider',
+          'http://127.0.0.1:3000/',
         ]
       interval: 20s
       timeout: 8s
@@ -96,6 +97,8 @@ services:
     init: true
     restart: unless-stopped
     env_file: .env
+    environment:
+      SPARK_RECYCLE_AFTER_RUN: ${SPARK_RECYCLE_AFTER_RUN:-1}
     command: ['python', '-m', 'app.worker']
     volumes:
       - spark_data:/app/data

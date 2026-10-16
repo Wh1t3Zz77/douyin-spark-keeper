@@ -122,6 +122,19 @@ def _context_page(context) -> Page:
     return context.pages[0] if context.pages else context.new_page()
 
 
+def _limit_send_assets(context) -> None:
+    # Sending needs conversation data and text controls. Decoding chat images
+    # and videos can exhaust a small host even below the worker's hard limit.
+    # Binding/sync contexts keep their normal image loading (including QR).
+    def handle(route):
+        if route.request.resource_type in {"image", "media"}:
+            route.abort()
+        else:
+            route.continue_()
+
+    context.route("**/*", handle)
+
+
 def _visible_text(page: Page, words: tuple[str, ...]) -> str | None:
     for word in words:
         try:
@@ -831,6 +844,7 @@ def send_batch(
                 locale="zh-CN",
                 timezone_id="Asia/Shanghai",
             )
+            _limit_send_assets(context)
             page = _context_page(context)
             LOGGER.info("browser phase=chat_navigation")
             page.goto(CHAT_URL, timeout=45000, wait_until="commit")

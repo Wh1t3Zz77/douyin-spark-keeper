@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from sqlalchemy import and_, func, or_, select
 
@@ -25,6 +26,44 @@ CHINA_TZ = timezone(timedelta(hours=8))
 AUTOMATION_GUARD = timedelta(minutes=6)
 RUN_TIMEOUT_SECONDS = 20 * 60
 RUN_STOP_GRACE_SECONDS = 10
+RUN_PRESSURE_POLL_SECONDS = 2
+RUN_PRESSURE_SAMPLES = 3
+
+
+class BrowserResourcePressure(RuntimeError):
+    pass
+
+
+def _host_memory_under_pressure() -> bool:
+    """PSI detects reclaim stalls even when MemAvailable looks sufficient."""
+    try:
+        lines = Path('/proc/pressure/memory').read_text().splitlines()
+        full = next(line for line in lines if line.startswith('full '))
+        values = dict(pair.split('=') for pair in full.split()[1:])
+        if float(values['avg10']) >= 10:
+            return True
+        for line in Path('/proc/meminfo').read_text().splitlines():
+            if line.startswith('MemAvailable:'):
+                return int(line.split()[1]) < 128 * 1024
+    except (OSError, ValueError, KeyError, StopIteration):
+        # PSI is Linux-specific. Keep the existing timeout on other platforms.
+        pass
+    return False
+
+
+def _wait_for_run_process(process: subprocess.Popen) -> int:
+    deadline = time.monotonic() + RUN_TIMEOUT_SECONDS
+    pressure_samples = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(process.args, RUN_TIMEOUT_SECONDS)
+        try:
+            return process.wait(timeout=min(RUN_PRESSURE_POLL_SECONDS, remaining))
+        except subprocess.TimeoutExpired:
+            pressure_samples = pressure_samples + 1 if _host_memory_under_pressure() else 0
+            if pressure_samples >= RUN_PRESSURE_SAMPLES:
+                raise BrowserResourcePressure('sustained host memory pressure')
 
 
 def _current_schedule(value: datetime, now: datetime) -> datetime:
@@ -680,7 +719,10 @@ def settle_interrupted_run(run_id: str, error_code: str) -> None:
                 item.finished_at = now
         run.status = "needs_review" if may_have_sent else "failed"
         run.error_code = error_code
-        run.error_message = "浏览器任务超时，已停止；请核对发送结果" if error_code == "RUN_TIMEOUT" else "浏览器进程异常退出，已停止；请核对发送结果"
+        run.error_message = {
+            "RUN_TIMEOUT": "浏览器任务超时，已停止；请核对发送结果",
+            "RUN_RESOURCE_PRESSURE": "服务器持续内存等待，已停止浏览器以保护网站；请核对发送结果",
+        }.get(error_code, "浏览器进程异常退出，已停止；请核对发送结果")
         run.finished_at = now
         notify_failure(
             db,
@@ -725,7 +767,13 @@ def execute_run_isolated(run_id: str) -> None:
         settle_interrupted_run(run_id, "WORKER_EXITED")
         return
     try:
-        exit_code = process.wait(timeout=RUN_TIMEOUT_SECONDS)
+        exit_code = _wait_for_run_process(process)
+    except BrowserResourcePressure:
+        logger.error("browser run stopped for sustained host memory pressure: %s", run_id)
+        if not _stop_run_process_group(process):
+            raise RuntimeError("browser process group did not stop after resource pressure")
+        settle_interrupted_run(run_id, "RUN_RESOURCE_PRESSURE")
+        return
     except subprocess.TimeoutExpired:
         logger.error("browser run exceeded %ss: %s", RUN_TIMEOUT_SECONDS, run_id)
         if not _stop_run_process_group(process):
@@ -749,18 +797,37 @@ def execute_run_isolated(run_id: str) -> None:
 def main() -> None:
     Base.metadata.create_all(engine)
     logger.info("single-browser worker started")
+    pressure_paused = False
     while True:
+        run_id = None
         try:
             schedule_due_tasks()
             process_daily_notifications()
+            if _host_memory_under_pressure():
+                if not pressure_paused:
+                    logger.warning("browser work paused until host memory pressure clears")
+                pressure_paused = True
+                time.sleep(RUN_PRESSURE_POLL_SECONDS)
+                continue
+            if pressure_paused:
+                logger.info("host memory pressure cleared; browser queue resumed")
+                pressure_paused = False
             run_id = claim_one()
             if run_id:
                 execute_run_isolated(run_id)
+                if os.getenv('SPARK_RECYCLE_AFTER_RUN') == '1':
+                    # Docker restart + init closes the entire PID namespace,
+                    # including browser processes that create their own group.
+                    logger.info("browser run settled; recycling worker container")
+                    return
             elif not automation_due_soon():
                 if not process_binding():
                     process_contact_sync()
         except Exception:
             logger.exception("worker loop failed")
+            if run_id and os.getenv('SPARK_RECYCLE_AFTER_RUN') == '1':
+                logger.error("browser supervisor failed; recycling worker container")
+                return
         time.sleep(10)
 
 

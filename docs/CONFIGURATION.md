@@ -13,6 +13,7 @@
 | `BOOTSTRAP_INVITE_USES`              | `1`                         | 首次邀请码最多使用次数                                                         |
 | `SPARK_BIND_ADDRESS`                 | `127.0.0.1`                 | `0.0.0.0` 表示允许外部设备连接                                                 |
 | `SPARK_PORT`                         | `3000`                      | 浏览器访问端口                                                                 |
+| `SPARK_RECYCLE_AFTER_RUN`            | Compose 默认 `1`            | 每批发送后退出并由容器重启清理浏览器；需要 `restart: unless-stopped`，直接运行 Python 时默认关闭 |
 | `ALLOWED_ORIGINS`                    | 本机地址                    | 逗号分隔的允许来源                                                             |
 | `SESSION_SECURE`                     | `false`                     | HTTPS 公网部署必须设为 `true`                                                  |
 | `SESSION_DAYS`                       | `30`                        | 登录会话有效天数                                                               |

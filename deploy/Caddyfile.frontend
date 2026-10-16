@@ -1,0 +1,11 @@
+{
+	admin off
+	auto_https off
+}
+
+:3000 {
+	root * /srv
+	encode gzip
+	file_server
+	header -Server
+}
