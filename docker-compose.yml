@@ -102,8 +102,8 @@ services:
     command: ['python', '-m', 'app.worker']
     volumes:
       - spark_data:/app/data
-    mem_limit: 900m
-    memswap_limit: 900m
+    mem_limit: 1024m
+    memswap_limit: 1024m
     shm_size: 192m
     depends_on:
       api:

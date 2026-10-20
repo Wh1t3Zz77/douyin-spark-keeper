@@ -27,33 +27,50 @@ AUTOMATION_GUARD = timedelta(minutes=6)
 RUN_TIMEOUT_SECONDS = 20 * 60
 RUN_STOP_GRACE_SECONDS = 10
 RUN_PRESSURE_POLL_SECONDS = 2
-RUN_PRESSURE_SAMPLES = 3
+RUN_PRESSURE_SAMPLES = 10
+RUN_CRITICAL_PRESSURE_SAMPLES = 3
 
 
 class BrowserResourcePressure(RuntimeError):
     pass
 
 
-def _host_memory_under_pressure() -> bool:
-    """PSI detects reclaim stalls even when MemAvailable looks sufficient."""
+def _memory_pressure_snapshot() -> dict:
+    """Record only resource counters, never account or browser contents."""
+    snapshot = {}
     try:
         lines = Path('/proc/pressure/memory').read_text().splitlines()
         full = next(line for line in lines if line.startswith('full '))
         values = dict(pair.split('=') for pair in full.split()[1:])
-        if float(values['avg10']) >= 10:
-            return True
+        snapshot['host_full_avg10'] = float(values['avg10'])
+    except (OSError, ValueError, KeyError, StopIteration):
+        pass
+    try:
         for line in Path('/proc/meminfo').read_text().splitlines():
             if line.startswith('MemAvailable:'):
-                return int(line.split()[1]) < 128 * 1024
-    except (OSError, ValueError, KeyError, StopIteration):
-        # PSI is Linux-specific. Keep the existing timeout on other platforms.
+                snapshot['available_kib'] = int(line.split()[1])
+                break
+    except (OSError, ValueError):
         pass
-    return False
+    return snapshot
+
+
+def _host_memory_under_pressure() -> bool:
+    """PSI detects reclaim stalls even when MemAvailable looks sufficient."""
+    snapshot = _memory_pressure_snapshot()
+    return (snapshot.get('host_full_avg10', 0) >= 10
+            or snapshot.get('available_kib', 128 * 1024) < 128 * 1024)
+
+
+def _critical_memory_pressure(snapshot: dict) -> bool:
+    return (snapshot.get('host_full_avg10', 0) >= 30
+            or snapshot.get('available_kib', 128 * 1024) < 128 * 1024)
 
 
 def _wait_for_run_process(process: subprocess.Popen) -> int:
     deadline = time.monotonic() + RUN_TIMEOUT_SECONDS
     pressure_samples = 0
+    critical_samples = 0
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -62,7 +79,12 @@ def _wait_for_run_process(process: subprocess.Popen) -> int:
             return process.wait(timeout=min(RUN_PRESSURE_POLL_SECONDS, remaining))
         except subprocess.TimeoutExpired:
             pressure_samples = pressure_samples + 1 if _host_memory_under_pressure() else 0
-            if pressure_samples >= RUN_PRESSURE_SAMPLES:
+            snapshot = _memory_pressure_snapshot() if pressure_samples else {}
+            critical_samples = critical_samples + 1 if _critical_memory_pressure(snapshot) else 0
+            if pressure_samples:
+                logger.warning('browser memory pressure sample=%s critical_samples=%s counters=%s',
+                               pressure_samples, critical_samples, snapshot)
+            if pressure_samples >= RUN_PRESSURE_SAMPLES or critical_samples >= RUN_CRITICAL_PRESSURE_SAMPLES:
                 raise BrowserResourcePressure('sustained host memory pressure')
 
 
@@ -714,8 +736,9 @@ def settle_interrupted_run(run_id: str, error_code: str) -> None:
             elif item.status in {"submitted", "uncertain"}:
                 may_have_sent = True
             elif item.status == "pending":
-                item.status = "skipped"
-                item.reason = "同批次浏览器任务中断，已停止后续发送"
+                item.status = "failed" if error_code == "RUN_RESOURCE_PRESSURE" else "skipped"
+                item.reason = ("内存压力暂停，尚未开始发送" if error_code == "RUN_RESOURCE_PRESSURE"
+                               else "同批次浏览器任务中断，已停止后续发送")
                 item.finished_at = now
         run.status = "needs_review" if may_have_sent else "failed"
         run.error_code = error_code
@@ -724,6 +747,23 @@ def settle_interrupted_run(run_id: str, error_code: str) -> None:
             "RUN_RESOURCE_PRESSURE": "服务器持续内存等待，已停止浏览器以保护网站；请核对发送结果",
         }.get(error_code, "浏览器进程异常退出，已停止；请核对发送结果")
         run.finished_at = now
+        if error_code == "RUN_RESOURCE_PRESSURE" and not any(i.status == "uncertain" for i in run.items):
+            retry_items = [i for i in run.items if i.status == "failed"]
+            if retry_items and run.attempt < 3 and entitlement_is_active(db, run.user_id):
+                _create_retry(db, run, retry_items)
+                run.error_message = "内存压力保护已暂停浏览器；压力恢复后重试未发送项，最多共 3 次尝试"
+                logger.info('pressure recovery queued: run=%s attempt=%s items=%s',
+                            run.id, run.attempt + 1, len(retry_items))
+                db.commit()
+                return
+            if run.items and all(i.status == "submitted" for i in run.items):
+                run.status = "success"
+                run.error_code = None
+                run.error_message = None
+                _settle_retry_ancestors(db, run)
+                db.commit()
+                return
+            run.status = "failed"
         notify_failure(
             db,
             run,
@@ -805,7 +845,8 @@ def main() -> None:
             process_daily_notifications()
             if _host_memory_under_pressure():
                 if not pressure_paused:
-                    logger.warning("browser work paused until host memory pressure clears")
+                    logger.warning("browser work paused until host memory pressure clears: counters=%s",
+                                   _memory_pressure_snapshot())
                 pressure_paused = True
                 time.sleep(RUN_PRESSURE_POLL_SECONDS)
                 continue

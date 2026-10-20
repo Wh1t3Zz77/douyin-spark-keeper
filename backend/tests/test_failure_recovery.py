@@ -132,7 +132,8 @@ def test_interruption_settles_all_retry_ancestors_once(recovery_db,error_code):
     worker.settle_interrupted_run(child.id,error_code);worker.settle_interrupted_run(child.id,error_code);db.expire_all()
     assert all(db.get(Run,r.id).status=='needs_review' for r in (root,middle,child))
     assert all(db.get(Run,r.id).error_code==error_code for r in (root,middle,child))
-    assert sorted(i.status for i in db.get(Run,child.id).items)==['skipped','uncertain']
+    expected='failed' if error_code=='RUN_RESOURCE_PRESSURE' else 'skipped'
+    assert sorted(i.status for i in db.get(Run,child.id).items)==[expected,'uncertain']
     assert len(db.scalars(select(EmailOutbox)).all())==2
 
 
@@ -313,10 +314,10 @@ def test_pressure_monitor_stops_before_hard_deadline_and_settles(monkeypatch,rec
     monkeypatch.setattr(worker,'_host_memory_under_pressure',lambda:True)
     stop=Mock(return_value=True);monkeypatch.setattr(worker,'_stop_run_process_group',stop)
     worker.execute_run_isolated(run.id);db.expire_all()
-    assert process.wait.call_count==3
+    assert process.wait.call_count==10
     stop.assert_called_once_with(process)
     assert db.get(Run,run.id).error_code=='RUN_RESOURCE_PRESSURE'
-    assert sorted(i.status for i in db.get(Run,run.id).items)==['skipped','uncertain']
+    assert sorted(i.status for i in db.get(Run,run.id).items)==['failed','uncertain']
     assert len(db.scalars(select(EmailOutbox)).all())==2
 
 
