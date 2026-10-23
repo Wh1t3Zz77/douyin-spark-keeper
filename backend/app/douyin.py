@@ -733,23 +733,36 @@ def _verify_conversation(page: Page, external_id: str) -> bool:
         return False
 
 
-def _scroll_conversations(page: Page, delta: int) -> None:
+def _scroll_conversations(page: Page, delta: int) -> bool | None:
     # The site's navigation/sidebar widths vary between accounts. Target the
     # actual conversation scroller rather than a fixed screen coordinate.
     moved = page.evaluate("""delta => {
         const title = [...document.querySelectorAll('.conversationConversationItemtitle')]
             .find(node => node.getClientRects().length && getComputedStyle(node).visibility !== 'hidden');
         for (let node = title?.parentElement; node && node !== document.body; node = node.parentElement) {
-            if (node.clientHeight > 0 && node.scrollHeight > node.clientHeight + 1
-                && /auto|scroll/.test(getComputedStyle(node).overflowY)) {
+            if (node.clientHeight > 0 && /auto|scroll/.test(getComputedStyle(node).overflowY)) {
                 const step = Math.min(delta, Math.max(40, node.clientHeight * 0.8));
+                const rect = node.getBoundingClientRect();
+                if (node.scrollHeight <= node.clientHeight + 1) {
+                    // Some lists request the next page on wheel before an
+                    // overflowing spacer exists. Aim at this list, not x=190.
+                    return {x: rect.left + rect.width / 2,
+                            y: Math.max(0, rect.top) + Math.min(rect.height, innerHeight - Math.max(0, rect.top)) / 2,
+                            delta: delta < 0 ? delta : step, progressed: false};
+                }
+                const before = node.scrollTop;
                 node.scrollTop = delta < 0 ? 0 : node.scrollTop + step;
-                return true;
+                return {progressed: node.scrollTop !== before};
             }
         }
         return false;
     }""", delta)
-    if moved is not True:
+    if isinstance(moved, dict):
+        if 'x' in moved:
+            page.mouse.move(moved['x'], moved['y'])
+            page.mouse.wheel(0, moved['delta'])
+        return moved['progressed']
+    elif moved is not True:
         page.mouse.move(190, 500)
         page.mouse.wheel(0, delta)
 
@@ -763,6 +776,7 @@ def _find_conversation_title(page: Page, name: str, external_id: str | None = No
         titles = page.locator(".conversationConversationItemtitle")
         _scroll_conversations(page, -12000)
         page.wait_for_timeout(700)
+        stalled = 0
         for _ in range(96):
             if time.monotonic() >= deadline:
                 break
@@ -775,7 +789,13 @@ def _find_conversation_title(page: Page, name: str, external_id: str | None = No
                 return titles.nth(matches[0]), name
             if time.monotonic() >= deadline:
                 break
-            _scroll_conversations(page, 650)
+            progressed = _scroll_conversations(page, 650)
+            stalled = stalled + 1 if progressed is False else 0
+            if stalled >= 3:
+                # Late-loaded rows can appear above the current viewport.
+                # Rescan after reaching the end, within the same deadline.
+                _scroll_conversations(page, -12000)
+                stalled = 0
             page.wait_for_timeout(min(450, max(1, int((deadline-time.monotonic())*1000))))
     except Exception:
         LOGGER.warning("conversation lookup failed; elapsed_seconds=%.1f", time.monotonic()-started)
@@ -888,10 +908,10 @@ def send_batch(
     state = json.loads(storage_state_json)
     results: list[SendResult] = []
     with sync_playwright() as playwright:
-        # Text sends use an isolated short-lived context; binding and contact
-        # synchronization retain their persistent profile behavior.
-        context = None
-        browser = playwright.chromium.launch(headless=True, args=BROWSER_ARGS)
+        # Keep the account profile: storage_state does not include the local
+        # conversation cache needed to find older recipients.
+        context = _persistent_context(playwright, state, profile_key) if profile_key else None
+        browser = None if context else playwright.chromium.launch(headless=True, args=BROWSER_ARGS)
         try:
             context = context or browser.new_context(
                 storage_state=state,

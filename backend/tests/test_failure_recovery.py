@@ -301,6 +301,32 @@ def test_lookup_scrolls_real_virtual_list_without_skipping_short_viewports():
         browser.close()
 
 
+def test_lookup_wheels_actual_list_to_request_missing_lazy_page():
+    from playwright.sync_api import Error,sync_playwright
+    with sync_playwright() as p:
+        try:
+            browser=p.chromium.launch(headless=True,executable_path=os.environ.get('TEST_BROWSER_EXECUTABLE'),args=['--no-sandbox','--disable-dev-shm-usage'])
+        except Error as exc:
+            if "Executable doesn't exist" in str(exc):pytest.skip('Playwright Chromium is not installed')
+            raise
+        page=browser.new_page(viewport={'width':1100,'height':700})
+        page.set_content('''<div id="list" style="position:absolute;left:620px;top:80px;width:280px;height:160px;overflow-y:auto">
+          <div style="height:160px;position:relative" id="rows"></div></div>
+          <script>
+          const list=document.querySelector('#list'),rows=document.querySelector('#rows');
+          function render(){rows.innerHTML='';const first=Math.floor(list.scrollTop/40);
+            for(let i=first;i<Math.min(rows.style.height==='160px'?2:40,first+5);i++){
+              const title=document.createElement('div');title.className='conversationConversationItemtitle';
+              title.style='position:absolute;height:40px;top:'+i*40+'px';title.textContent='same';
+              title.__reactFiber$test={memoizedProps:{conversation:{id:'c'+i}}};rows.append(title);
+            }}list.addEventListener('scroll',render);list.addEventListener('wheel',()=>{rows.style.height='1600px';render()});render();</script>''')
+        match=douyin._find_conversation_title(page,'same','conv:c25')
+        assert match is not None
+        assert match[0].evaluate(douyin.IDENTITY_READER)['conversation_id']=='c25'
+        assert page.locator('#list').evaluate('(node)=>node.scrollTop')>0
+        browser.close()
+
+
 def test_smtp_retry_logs_survive_success_without_private_details(recovery_db,monkeypatch,caplog):
     db=recovery_db;seed(db)
     item=EmailOutbox(recipient='private@example.test',subject='synthetic',body='private body')
@@ -419,3 +445,29 @@ def test_configured_worker_recycles_after_one_browser_run(monkeypatch,supervisor
     monkeypatch.setattr(worker,'execute_run_isolated',execute)
     worker.main()
     claim.assert_called_once();execute.assert_called_once_with('synthetic-run')
+
+
+def test_lookup_rescans_late_rows_loaded_above_current_viewport():
+    from playwright.sync_api import Error,sync_playwright
+    with sync_playwright() as p:
+        try:
+            browser=p.chromium.launch(headless=True,executable_path=os.environ.get('TEST_BROWSER_EXECUTABLE'),args=['--no-sandbox','--disable-dev-shm-usage'])
+        except Error as exc:
+            if "Executable doesn't exist" in str(exc):pytest.skip('Playwright Chromium is not installed')
+            raise
+        page=browser.new_page(viewport={'width':1100,'height':700})
+        page.set_content('''<div id="list" style="position:absolute;left:620px;top:80px;width:280px;height:160px;overflow-y:auto">
+          <div style="height:1600px;position:relative" id="rows"></div></div>
+          <script>
+          const list=document.querySelector('#list'),rows=document.querySelector('#rows');
+          function render(){rows.innerHTML='';const first=Math.floor(list.scrollTop/40);
+            for(let i=first;i<Math.min(40,first+5);i++){
+              const title=document.createElement('div');title.className='conversationConversationItemtitle';
+              title.style='position:absolute;height:40px;top:'+i*40+'px';title.textContent='same';
+              title.__reactFiber$test={memoizedProps:{conversation:{id:i===0&&window.ready?'late':'c'+i}}};rows.append(title);
+            }}list.addEventListener('scroll',render);render();setTimeout(()=>{window.ready=true;render()},4000);</script>''')
+        match=douyin._find_conversation_title(page,'same','conv:late')
+        assert match is not None
+        assert match[0].evaluate(douyin.IDENTITY_READER)['conversation_id']=='late'
+        assert page.evaluate('Boolean(window.ready)')
+        browser.close()
