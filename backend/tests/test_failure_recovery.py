@@ -181,6 +181,46 @@ def test_submission_exception_distinguishes_safe_retry_from_unknown_delivery(mon
     assert douyin._send_one(page,'synthetic friend','synthetic message','conv:synthetic').status==expected
 
 
+@pytest.mark.parametrize('phase',['lookup','input','identity','challenge'])
+def test_pre_submission_failures_never_mark_item_as_sending(monkeypatch,phase):
+    page=Mock();box=page.locator.return_value.first
+    box.count.return_value=1;box.is_visible.return_value=True
+    box.inner_text.return_value='synthetic message'
+    monkeypatch.setattr(douyin,'_open_contact',lambda *a:phase!='lookup')
+    monkeypatch.setattr(douyin,'_verify_conversation',lambda *a:phase!='identity')
+    monkeypatch.setattr(douyin,'security_challenge',lambda *a:'verification required' if phase=='challenge' else None)
+    if phase=='input':box.click.side_effect=RuntimeError('synthetic input failed')
+    before=Mock()
+    value=douyin._send_one(page,'same','synthetic message','conv:one',before)
+    assert value.status in ['failed','security_challenge']
+    before.assert_not_called()
+    assert not any(c.args==('Enter',) for c in page.keyboard.press.call_args_list)
+
+
+def test_database_send_marker_commits_only_immediately_before_enter(monkeypatch):
+    page=Mock();box=page.locator.return_value.first;events=[]
+    box.count.return_value=1;box.is_visible.return_value=True
+    box.inner_text.side_effect=['synthetic message','']
+    monkeypatch.setattr(douyin,'_open_contact',lambda *a:True)
+    monkeypatch.setattr(douyin,'security_challenge',lambda *a:None)
+    monkeypatch.setattr(douyin,'_verify_conversation',lambda *a:events.append('identity') or True)
+    page.keyboard.press.side_effect=lambda k:events.append('enter') if k=='Enter' else None
+    value=douyin._send_one(page,'same','synthetic message','conv:one',lambda:events.append('committed'))
+    assert value.status=='submitted'
+    assert events==['identity','committed','enter']
+
+
+def test_send_marker_failure_prevents_submission(monkeypatch):
+    page=Mock();box=page.locator.return_value.first
+    box.count.return_value=1;box.is_visible.return_value=True;box.inner_text.return_value='synthetic message'
+    monkeypatch.setattr(douyin,'_open_contact',lambda *a:True)
+    monkeypatch.setattr(douyin,'security_challenge',lambda *a:None)
+    monkeypatch.setattr(douyin,'_verify_conversation',lambda *a:True)
+    value=douyin._send_one(page,'same','synthetic message','conv:one',Mock(side_effect=RuntimeError('synthetic database unavailable')))
+    assert value.status=='failed'
+    assert not any(c.args==('Enter',) for c in page.keyboard.press.call_args_list)
+
+
 def test_lookup_refuses_duplicate_stable_identity():
     page=Mock();page.locator.return_value.evaluate_all.return_value=[0,1]
     assert douyin._find_conversation_title(page,'same','conv:stable') is None
@@ -195,6 +235,16 @@ def test_lookup_stops_scanning_when_budget_is_used(monkeypatch):
     monkeypatch.setattr(douyin,'time',SimpleNamespace(monotonic=lambda:clock[0]))
     assert douyin._find_conversation_title(page,'same','conv:missing') is None
     assert page.locator.return_value.evaluate_all.call_count==3
+
+
+def test_lookup_can_wait_for_late_loaded_conversations_within_budget(monkeypatch):
+    clock=[0.0];page=Mock();titles=page.locator.return_value
+    page.wait_for_timeout.side_effect=lambda ms:clock.__setitem__(0,clock[0]+ms/1000)
+    titles.evaluate_all.side_effect=[[] for _ in range(40)]+[[2]]
+    monkeypatch.setattr(douyin,'time',SimpleNamespace(monotonic=lambda:clock[0]))
+    assert douyin._find_conversation_title(page,'same','conv:late')[0] is titles.nth.return_value
+    assert titles.evaluate_all.call_count==41
+    assert clock[0]<45
 
 
 def test_browser_batch_identity_matching_and_recycled_row_rejection():
@@ -222,6 +272,32 @@ def test_browser_batch_identity_matching_and_recycled_row_rejection():
         assert titles.evaluate_all(douyin.CONVERSATION_MATCHES,'conv:c70')==[70]
         page.evaluate("document.querySelector('#row70').__reactFiber$test.memoizedProps.conversation.id='recycled'")
         assert not douyin._click_conversation_title(page,titles.nth(70),'conv:c70')
+        browser.close()
+
+
+def test_lookup_scrolls_real_virtual_list_without_skipping_short_viewports():
+    from playwright.sync_api import Error,sync_playwright
+    with sync_playwright() as p:
+        try:
+            browser=p.chromium.launch(headless=True,executable_path=os.environ.get('TEST_BROWSER_EXECUTABLE'),args=['--no-sandbox','--disable-dev-shm-usage'])
+        except Error as exc:
+            if "Executable doesn't exist" in str(exc):pytest.skip('Playwright Chromium is not installed')
+            raise
+        page=browser.new_page(viewport={'width':1100,'height':700})
+        page.set_content('''<div id="list" style="position:absolute;left:620px;top:80px;width:280px;height:160px;overflow-y:auto">
+          <div style="height:1600px;position:relative" id="rows"></div></div>
+          <script>
+          const list=document.querySelector('#list'),rows=document.querySelector('#rows');
+          function render(){rows.innerHTML='';const first=Math.floor(list.scrollTop/40);
+            for(let i=first;i<Math.min(40,first+5);i++){
+              const title=document.createElement('div');title.className='conversationConversationItemtitle';
+              title.style='position:absolute;height:40px;top:'+i*40+'px';title.textContent='same';
+              title.__reactFiber$test={memoizedProps:{conversation:{id:'c'+i}}};rows.append(title);
+            }}list.addEventListener('scroll',render);render();</script>''')
+        match=douyin._find_conversation_title(page,'same','conv:c25')
+        assert match is not None
+        assert match[0].evaluate(douyin.IDENTITY_READER)['conversation_id']=='c25'
+        assert page.locator('#list').evaluate('(node)=>node.scrollTop')>0
         browser.close()
 
 

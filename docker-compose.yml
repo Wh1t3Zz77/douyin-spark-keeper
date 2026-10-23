@@ -103,7 +103,7 @@ services:
     volumes:
       - spark_data:/app/data
     mem_limit: 1024m
-    memswap_limit: 1024m
+    memswap_limit: ${SPARK_WORKER_MEMSWAP_LIMIT:-1024m}
     shm_size: 192m
     depends_on:
       api:

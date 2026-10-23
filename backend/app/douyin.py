@@ -19,7 +19,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import Page, sync_playwright, Error as PlaywrightError
 from .identity_dom import IDENTITY_READER, ProfileCollector, identity_matches
 
 
@@ -733,6 +733,27 @@ def _verify_conversation(page: Page, external_id: str) -> bool:
         return False
 
 
+def _scroll_conversations(page: Page, delta: int) -> None:
+    # The site's navigation/sidebar widths vary between accounts. Target the
+    # actual conversation scroller rather than a fixed screen coordinate.
+    moved = page.evaluate("""delta => {
+        const title = [...document.querySelectorAll('.conversationConversationItemtitle')]
+            .find(node => node.getClientRects().length && getComputedStyle(node).visibility !== 'hidden');
+        for (let node = title?.parentElement; node && node !== document.body; node = node.parentElement) {
+            if (node.clientHeight > 0 && node.scrollHeight > node.clientHeight + 1
+                && /auto|scroll/.test(getComputedStyle(node).overflowY)) {
+                const step = Math.min(delta, Math.max(40, node.clientHeight * 0.8));
+                node.scrollTop = delta < 0 ? 0 : node.scrollTop + step;
+                return true;
+            }
+        }
+        return false;
+    }""", delta)
+    if moved is not True:
+        page.mouse.move(190, 500)
+        page.mouse.wheel(0, delta)
+
+
 def _find_conversation_title(page: Page, name: str, external_id: str | None = None):
     if not external_id:
         return None
@@ -740,10 +761,9 @@ def _find_conversation_title(page: Page, name: str, external_id: str | None = No
     deadline = started + CONTACT_LOOKUP_TIMEOUT_SECONDS
     try:
         titles = page.locator(".conversationConversationItemtitle")
-        page.mouse.move(190, 500)
-        page.mouse.wheel(0, -12000)
+        _scroll_conversations(page, -12000)
         page.wait_for_timeout(700)
-        for _ in range(32):
+        for _ in range(96):
             if time.monotonic() >= deadline:
                 break
             # A single DOM snapshot avoids hundreds of locator round trips and
@@ -755,7 +775,7 @@ def _find_conversation_title(page: Page, name: str, external_id: str | None = No
                 return titles.nth(matches[0]), name
             if time.monotonic() >= deadline:
                 break
-            page.mouse.wheel(0, 650)
+            _scroll_conversations(page, 650)
             page.wait_for_timeout(min(450, max(1, int((deadline-time.monotonic())*1000))))
     except Exception:
         LOGGER.warning("conversation lookup failed; elapsed_seconds=%.1f", time.monotonic()-started)
@@ -781,7 +801,8 @@ def _open_contact(page: Page, name: str, external_id: str | None = None) -> bool
     return bool(match and _click_conversation_title(page, match[0], external_id))
 
 
-def _send_one(page: Page, name: str, message: str, external_id: str | None = None) -> SendResult:
+def _send_one(page: Page, name: str, message: str, external_id: str | None = None,
+              on_before_submit: Callable[[], None] | None = None) -> SendResult:
     if not external_id:
         return SendResult(name, "needs_selection", "缺少稳定好友标识，请重新同步好友并重新选择")
     LOGGER.info("browser phase=conversation_lookup")
@@ -809,6 +830,8 @@ def _send_one(page: Page, name: str, message: str, external_id: str | None = Non
             page.keyboard.press("Delete")
             return SendResult(name, "failed", "发送前会话身份校验失败，已停止发送")
         LOGGER.info("browser phase=message_submit")
+        if on_before_submit:
+            on_before_submit()
         submission_started = True
         page.keyboard.press("Enter")
         deadline = time.time() + 8
@@ -823,6 +846,36 @@ def _send_one(page: Page, name: str, message: str, external_id: str | None = Non
         return SendResult(name, "failed", f"发送异常：{str(exc)[:180]}")
 
 
+def _load_send_chat(page: Page) -> str | None:
+    """Recover an incomplete first load before any recipient enters sending."""
+    navigated = False
+    for attempt in range(3):
+        try:
+            page.goto(CHAT_URL, timeout=45000, wait_until="commit")
+            navigated = True
+            page.wait_for_timeout(7000)
+            logged, reason = login_state(page)
+            challenge = security_challenge(page)
+            if challenge:
+                return "security_challenge:" + challenge
+            if not logged:
+                return "logged_out:" + reason
+            page.wait_for_selector(".conversationConversationItemtitle", timeout=30000)
+            return None
+        except PlaywrightError:
+            challenge = security_challenge(page)
+            if challenge:
+                return "security_challenge:" + challenge
+            if attempt < 2:
+                LOGGER.info("chat page incomplete; retrying initial load: attempt=%s", attempt + 2)
+                page.wait_for_timeout(3000)
+    if navigated:
+        logged, reason = login_state(page)
+        if not logged:
+            return "logged_out:" + reason
+    return "transient:抖音聊天页暂时没有加载出会话列表，登录状态未判为失效"
+
+
 def send_batch(
     storage_state_json: str,
     recipients: list[tuple[str, str, str | None, str]],
@@ -835,8 +888,10 @@ def send_batch(
     state = json.loads(storage_state_json)
     results: list[SendResult] = []
     with sync_playwright() as playwright:
-        context = _persistent_context(playwright, state, profile_key) if profile_key else None
-        browser = None if context else playwright.chromium.launch(headless=True, args=BROWSER_ARGS)
+        # Text sends use an isolated short-lived context; binding and contact
+        # synchronization retain their persistent profile behavior.
+        context = None
+        browser = playwright.chromium.launch(headless=True, args=BROWSER_ARGS)
         try:
             context = context or browser.new_context(
                 storage_state=state,
@@ -847,28 +902,16 @@ def send_batch(
             _limit_send_assets(context)
             page = _context_page(context)
             LOGGER.info("browser phase=chat_navigation")
-            page.goto(CHAT_URL, timeout=45000, wait_until="commit")
-            page.wait_for_timeout(7000)
-            logged, reason = login_state(page)
-            if not logged:
-                return results, "logged_out:" + reason, json.dumps(context.storage_state(), ensure_ascii=False)
-            try:
-                page.wait_for_selector(".conversationConversationItemtitle", timeout=30000)
-            except Exception:
-                logged, reason = login_state(page)
-                if not logged:
-                    return results, "logged_out:" + reason, json.dumps(context.storage_state(), ensure_ascii=False)
-                challenge = security_challenge(page)
-                if challenge:
-                    return results, "security_challenge:" + challenge, json.dumps(context.storage_state(), ensure_ascii=False)
-                return results, "transient:抖音聊天页暂时没有加载出会话列表，登录状态未判为失效", json.dumps(context.storage_state(), ensure_ascii=False)
+            fatal = _load_send_chat(page)
+            if fatal:
+                return results, fatal, json.dumps(context.storage_state(), ensure_ascii=False)
             for recipient in recipients:
                 name, message = recipient[:2]
                 external_id = recipient[2] if len(recipient) > 2 else None
-                if on_before_send:
-                    on_before_send(recipient[3] if len(recipient) > 3 else name)
                 LOGGER.info("browser item started: item=%s", recipient[3] if len(recipient) > 3 else "legacy")
-                result = _send_one(page, name, message, external_id)
+                item_id = recipient[3] if len(recipient) > 3 else name
+                before_submit = (lambda: on_before_send(item_id)) if on_before_send else None
+                result = _send_one(page, name, message, external_id, before_submit)
                 result.item_id = recipient[3] if len(recipient) > 3 else None
                 if on_result:
                     on_result(result)

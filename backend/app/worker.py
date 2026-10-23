@@ -101,7 +101,9 @@ def entitlement_is_active(db, user_id: str, now: datetime | None = None) -> bool
     """Return whether automated work is allowed at this exact moment."""
     now = now or utcnow()
     user = db.get(User, user_id)
-    if user and user.is_admin:
+    if not user or not user.is_active:
+        return False
+    if user.is_admin:
         return True
     entitlement = db.get(UserEntitlement, user_id)
     return bool(
@@ -215,6 +217,25 @@ def claim_one() -> str | None:
                 )
             _settle_retry_ancestors(db, item)
         if stale:
+            db.commit()
+        resource_waits = db.scalars(select(Run).where(
+            Run.status == "pending", Run.error_code == "RESOURCE_RETRY_WAIT"
+        )).all()
+        for item in resource_waits:
+            if now >= _resource_retry_deadline(db, item):
+                item.status = "failed"
+                item.error_code = "RESOURCE_RETRY_EXPIRED"
+                item.error_message = "当天内存压力持续未恢复，已停止跨日补发，避免发送过期消息"
+                item.finished_at = now
+                for child in item.items:
+                    if child.status == "pending":
+                        child.status = "failed"
+                        child.reason = item.error_message
+                        child.finished_at = now
+                notify_failure(db, item, failure_email_subject(db, item, "当天计划未完成"),
+                               failure_email_body(db, item, item.error_message), "task_failed")
+                _settle_retry_ancestors(db, item)
+        if resource_waits:
             db.commit()
         expired_pending = db.scalars(select(Run).where(Run.status == "pending", Run.scheduled_for <= now)).all()
         expired_changed = False
@@ -441,6 +462,56 @@ def _create_retry(db, run: Run, items: list[RunItem]) -> None:
     run.status = "retrying"
 
 
+def _resource_retry_deadline(db, run: Run) -> datetime:
+    root = run
+    seen = {root.id}
+    while root.parent_run_id:
+        parent = db.get(Run, root.parent_run_id)
+        if not parent or parent.task_id != run.task_id:
+            break
+        if parent.id in seen:
+            raise ValueError("Cyclic retry ancestry")
+        seen.add(parent.id)
+        root = parent
+    # Datetimes in the database are UTC without tzinfo. Never replay yesterday.
+    return (root.scheduled_for + timedelta(hours=8)).replace(
+        hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1, hours=-8)
+
+
+def _create_resource_retry(db, run: Run, items: list[RunItem]) -> bool:
+    if not items or any(item.status != "failed" for item in items):
+        raise ValueError("Resource recovery requires confirmed unsent items")
+    now = utcnow()
+    task = db.get(Task, run.task_id)
+    user = db.get(User, run.user_id)
+    if not task or not task.enabled or task.deleted_at or not user or not user.is_active or not entitlement_is_active(db, run.user_id, now):
+        return False
+    count = 1
+    ancestor = run
+    while ancestor.parent_run_id and count < 4:
+        ancestor = db.get(Run, ancestor.parent_run_id)
+        if not ancestor or ancestor.error_code != "RUN_RESOURCE_PRESSURE":
+            break
+        count += 1
+    delay = timedelta(minutes=min(30, 5 * 2 ** (count - 1)))
+    retry_at = now + delay
+    if retry_at >= _resource_retry_deadline(db, run):
+        return False
+    existing = db.scalar(select(Run).where(Run.parent_run_id == run.id))
+    if existing:
+        return existing.status in {"pending", "running", "retrying"}
+    retry = Run(task_id=run.task_id, user_id=run.user_id, parent_run_id=run.id,
+                scheduled_for=retry_at, status="pending", attempt=run.attempt,
+                error_code="RESOURCE_RETRY_WAIT",
+                error_message=f"内存保护暂停，{int(delay.total_seconds() / 60)} 分钟后自动恢复未发送项；不消耗发送失败次数")
+    retry.items = [RunItem(contact_name=item.contact_name, message=item.message,
+                          recipient_id=item.recipient_id, contact_id=item.contact_id,
+                          external_id=item.external_id) for item in items]
+    db.add(retry)
+    run.status = "retrying"
+    return True
+
+
 def _settle_retry_ancestors(db, run: Run) -> None:
     if run.status == "retrying":
         return
@@ -543,7 +614,17 @@ def execute_run(run_id: str) -> None:
             db.commit()
             return
         task = db.get(Task, run.task_id)
-        if not task:
+        if not task or not task.enabled or task.deleted_at:
+            run.status = "cancelled"
+            run.error_code = "TASK_DISABLED"
+            run.error_message = "计划已停用或删除，已取消后续恢复"
+            run.finished_at = utcnow()
+            for item in run.items:
+                if item.status == "pending":
+                    item.status = "skipped"
+                    item.reason = run.error_message
+            _settle_retry_ancestors(db, run)
+            db.commit()
             return
         account = db.get(DouyinAccount, task.account_id)
         if not account or account.status != "valid" or not account.state_ciphertext:
@@ -569,6 +650,13 @@ def execute_run(run_id: str) -> None:
         for item in run.items:
             if item.status != "pending":
                 continue
+            if run.error_code == "RESOURCE_RETRY_WAIT":
+                recipient = db.get(TaskRecipient, item.recipient_id) if item.recipient_id else None
+                if not recipient or not recipient.enabled or recipient.task_id != task.id or recipient.contact_id != item.contact_id:
+                    item.status = "skipped"
+                    item.reason = "等待恢复期间好友已移除或停用，未发送"
+                    item.finished_at = utcnow()
+                    continue
             contact = resolve_run_contact(db, task, item)
             if not contact:
                 item.status = "needs_selection"
@@ -710,6 +798,9 @@ def execute_run(run_id: str) -> None:
                 notify_failure(db, run, failure_email_subject(db, run, "连续失败 3 次"), failure_email_body(db, run, "你的续火任务连续执行 3 次仍未完成，已停止自动重试。"), "task_failed")
             else:
                 run.status = "success" if submitted else "skipped"
+        if run.status == "success":
+            run.error_code = None
+            run.error_message = None
         if run.status in {"failed", "needs_login", "needs_account", "security_challenge", "needs_review"}:
             preference = "security_challenge" if run.status == "security_challenge" else (
                 "login_expired" if run.status in {"needs_login", "needs_account"} else "task_failed")
@@ -749,11 +840,10 @@ def settle_interrupted_run(run_id: str, error_code: str) -> None:
         run.finished_at = now
         if error_code == "RUN_RESOURCE_PRESSURE" and not any(i.status == "uncertain" for i in run.items):
             retry_items = [i for i in run.items if i.status == "failed"]
-            if retry_items and run.attempt < 3 and entitlement_is_active(db, run.user_id):
-                _create_retry(db, run, retry_items)
-                run.error_message = "内存压力保护已暂停浏览器；压力恢复后重试未发送项，最多共 3 次尝试"
+            if retry_items and _create_resource_retry(db, run, retry_items):
+                run.error_message = "内存保护已暂停浏览器；当天按退避间隔自动恢复未发送项，不消耗普通失败重试次数"
                 logger.info('pressure recovery queued: run=%s attempt=%s items=%s',
-                            run.id, run.attempt + 1, len(retry_items))
+                            run.id, run.attempt, len(retry_items))
                 db.commit()
                 return
             if run.items and all(i.status == "submitted" for i in run.items):

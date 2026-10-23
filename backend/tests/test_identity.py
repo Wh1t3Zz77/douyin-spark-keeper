@@ -428,7 +428,10 @@ def test_send_batch_callbacks_use_item_id_without_real_browser(monkeypatch):
     monkeypatch.setattr(douyin,'sync_playwright',lambda:manager)
     monkeypatch.setattr(douyin,'_context_page',lambda _:page)
     monkeypatch.setattr(douyin,'login_state',lambda _: (True,''))
-    monkeypatch.setattr(douyin,'_send_one',lambda p,n,m,e:douyin.SendResult(n,'submitted'))
+    def submit(p,n,m,e,before):
+        before()
+        return douyin.SendResult(n,'submitted')
+    monkeypatch.setattr(douyin,'_send_one',submit)
     tokens=[]; results=[]
     rows=[('same','test','conv:one','item1'),('same','test','conv:two','item2')]
     output,fatal,state=douyin.send_batch('{}',rows,tokens.append,results.append)
